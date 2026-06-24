@@ -31,7 +31,7 @@
   "license": "ISC",
   "dependencies": {
     "@fortawesome/fontawesome-free": "^7.2.0",
-    "@google/generative-ai": "^0.24.1",
+    "@google/genai": "^2.9.0",
     "dotenv": "^16.3.1",
     "markdown": "^0.5.0",
     "marked": "^15.0.12",
@@ -56,16 +56,14 @@
       "!dist/**/*",
       "!*.md",
       "!.git/**/*",
-      "!.env*"
-    ],
-    "extraFiles": [
-      {
-        "from": "prompts",
-        "to": "prompts"
-      }
+      "!.env*",
+      "!.venv-whisper/**/*",
+      "!.whisper-models/**/*",
+      "!eng.traineddata"
     ],
     "asarUnpack": [
-      "node_modules/**/*"
+      "assests/icons/**/*",
+      "prompts/**/*"
     ],
     "mac": {
       "category": "public.app-category.utilities",
@@ -85,12 +83,9 @@
           ]
         }
       ],
-      "icon": "assets/icons/app-icon.icns",
       "darkModeSupport": true,
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist"
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
     },
     "win": {
       "target": [
@@ -109,7 +104,7 @@
           ]
         }
       ],
-      "icon": "assets/icons/app-icon.ico"
+      "sign": null
     },
     "linux": {
       "target": [
@@ -126,14 +121,36 @@
           ]
         }
       ],
-      "icon": "assets/icons/app-icon.png",
+      "icon": "assests/icons/app-icon.png",
       "category": "Utility"
+    },
+    "deb": {
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xauth",
+        "libasound2t64",
+        "libgbm1",
+        "python3 (>= 3.10)",
+        "python3-venv",
+        "python3-pip",
+        "ffmpeg"
+      ],
+      "fpm": [
+        "--after-install=scripts/post-install-deb.sh"
+      ]
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "perMachine": false,
+      "include": "scripts/post-install-nsis.nsh",
+      "deleteAppDataOnUninstall": false
     },
     "dmg": {
       "title": "OpenCluely Interview Assistant",

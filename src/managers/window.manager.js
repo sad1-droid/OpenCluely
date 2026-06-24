@@ -13,9 +13,15 @@ class WindowManager {
     this.screenWatcher = null;
     this.desktopWatcher = null;
     this.lastActiveSpace = null;
-    this.screenSharingWatcher = null;
+    this.screenCaptureAvailabilityWatcher = null;
     this.isScreenBeingShared = false;
     this.wasVisibleBeforeSharing = false;
+    this.screenCaptureStatus = {
+      available: null,
+      lastError: null,
+      lastCheckedAt: null
+    };
+    this.isCheckingScreenCaptureStatus = false;
     this.isInitialized = false;
     this.isInitializing = false;
     this.isRecording = false;
@@ -67,6 +73,23 @@ class WindowManager {
         alwaysOnTop: true,
         visibleOnAllWorkspaces: true,
         fullscreenable: false
+      },
+      onboarding: {
+        width: 560,
+        height: 680,
+        file: 'onboarding.html',
+        title: 'Welcome to OpenCluely',
+        frame: false,
+        titleBarStyle: 'hidden',
+        transparent: true,
+        skipTaskbar: true,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        closable: true,
+        alwaysOnTop: true,
+        visibleOnAllWorkspaces: true,
+        fullscreenable: false
       }
     };
 
@@ -77,27 +100,35 @@ class WindowManager {
     // ... existing initialization code ...
   }
 
-  async initializeWindows() {
+  async initializeWindows(options = {}) {
+    const { showMainWindow = true } = options;
     if (this.isInitialized || this.isInitializing) {
       logger.warn('Windows already initialized or initializing');
       return;
     }
 
     this.isInitializing = true;
-    logger.info('Initializing application windows');
+    logger.info('Initializing application windows', { showMainWindow });
     
     try {
-      await this.createMainWindow();
+      // Pass autoShow so the main window doesn't flash visible during
+      // first-run onboarding before the user has configured API keys.
+      await this.createMainWindow({ autoShow: showMainWindow });
       await this.createChatWindow();
       await this.createLLMResponseWindow();
       await this.createSettingsWindow();
       
       this.setupWindowEventHandlers();
       this.setupScreenTracking();
-      this.setupScreenSharingDetection();
+      this.setupScreenCaptureAvailabilityWatcher();
 
       // Make windows interactive by default so they are not click-through
       this.setInteractive(true);
+      
+      // Optionally show the main window (deferred during onboarding)
+      if (showMainWindow) {
+        await this.showMainWindow();
+      }
       
       this.isInitialized = true;
       this.isInitializing = false;
@@ -109,15 +140,55 @@ class WindowManager {
     }
   }
 
-  async createMainWindow() {
+  async showMainWindow() {
+    const mainWindow = this.windows.get('main');
+    if (!mainWindow) return;
+    
+    // Immediate always-on-top enforcement for main window
+    if (process.platform === 'darwin') {
+      try {
+        mainWindow.setAlwaysOnTop(true, 'screen-saver', 2);
+      } catch (error) {
+        mainWindow.setAlwaysOnTop(true, 'floating', 2);
+      }
+    } else {
+      mainWindow.setAlwaysOnTop(true);
+    }
+    
+    // Wait for app to fully initialize and detect current desktop
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    this.showOnCurrentDesktop(mainWindow);
+    
+    // Additional enforcement after showing
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    if (!mainWindow.isDestroyed()) {
+      if (process.platform === 'darwin') {
+        try {
+          mainWindow.setAlwaysOnTop(true, 'screen-saver', 2);
+        } catch (error) {
+          mainWindow.setAlwaysOnTop(true, 'floating', 2);
+        }
+      } else {
+        mainWindow.setAlwaysOnTop(true);
+      }
+    }
+    
+    this.isVisible = true;
+    logger.info('Main window displayed');
+    // Notify renderer to refresh speech availability
+    mainWindow.webContents.send('main-window-shown', {});
+  }
+
+  async createMainWindow(options = {}) {
+    const { autoShow = true } = options;
     if (this.windows.has('main')) {
       return this.windows.get('main');
     }
     const window = await this.createWindow('main', false); // Don't show during creation
     this.windows.set('main', window);
-    this.isVisible = true;
-    
-    // Immediate always-on-top enforcement for main window
+
+    // Always-on-top must be set even when we're deferring the visual
+    // show — it persists into the future showOnCurrentDesktop call.
     if (process.platform === 'darwin') {
       try {
         window.setAlwaysOnTop(true, 'screen-saver', 2);
@@ -127,30 +198,31 @@ class WindowManager {
     } else {
       window.setAlwaysOnTop(true);
     }
-    
-    // DevTools can be opened manually if needed for debugging
-    // window.webContents.openDevTools({ mode: 'detach' });
-    
-    // Wait for app to fully initialize and detect current desktop
-    setTimeout(() => {
-      this.showOnCurrentDesktop(window);
-      
-      // Additional enforcement after showing
+
+    // Only auto-show when explicitly allowed (e.g. not during first-run
+    // onboarding). The single entry point for showing the overlay is
+    // `showMainWindow()` — callers control timing via the flag below.
+    if (autoShow) {
+      // Wait for app to fully initialize and detect current desktop
       setTimeout(() => {
-        if (!window.isDestroyed()) {
-          if (process.platform === 'darwin') {
-            try {
-              window.setAlwaysOnTop(true, 'screen-saver', 2);
-            } catch (error) {
-              window.setAlwaysOnTop(true, 'floating', 2);
+        this.showOnCurrentDesktop(window);
+        // Additional enforcement after showing
+        setTimeout(() => {
+          if (!window.isDestroyed()) {
+            if (process.platform === 'darwin') {
+              try {
+                window.setAlwaysOnTop(true, 'screen-saver', 2);
+              } catch (error) {
+                window.setAlwaysOnTop(true, 'floating', 2);
+              }
+            } else {
+              window.setAlwaysOnTop(true);
             }
-          } else {
-            window.setAlwaysOnTop(true);
           }
-        }
-      }, 200);
-    }, 100);
-    
+        }, 200);
+      }, 100);
+    }
+
     return window;
   }
 
@@ -239,6 +311,27 @@ class WindowManager {
         backgroundColor: '#00000000',
         level: process.platform === 'darwin' ? 'floating' : undefined,
         // Additional macOS flags for better always-on-top behavior
+        ...(process.platform === 'darwin' && {
+          type: 'panel',
+          acceptFirstMouse: true,
+          disableAutoHideCursor: true
+        })
+      };
+  } else if (type === 'onboarding') {
+      // First-run onboarding wizard — same frameless/panel style as
+      // settings, but closable (X button) and slightly larger.
+      browserWindowOptions = {
+        ...baseOptions,
+        frame: false,
+        titleBarStyle: 'hidden',
+        transparent: true,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        closable: true,
+        hasShadow: true,
+        backgroundColor: '#00000000',
+        level: process.platform === 'darwin' ? 'floating' : undefined,
         ...(process.platform === 'darwin' && {
           type: 'panel',
           acceptFirstMouse: true,
@@ -814,39 +907,70 @@ class WindowManager {
     });
   }
 
-  setupScreenSharingDetection() {
+  setupScreenCaptureAvailabilityWatcher() {
     // Avoid screencast portal errors on Linux/Wayland by disabling periodic detection
     if (process.platform === 'linux') {
-      logger.info('Skipping screen sharing detection on Linux to avoid portal screencast errors');
+      logger.info('Skipping screen capture availability watcher on Linux to avoid portal screencast errors');
       return;
     }
 
-    // Reduced frequency to prevent performance issues
-    this.screenSharingWatcher = setInterval(async () => {
-      await this.checkScreenSharingStatus();
+    if (this.screenCaptureAvailabilityWatcher) {
+      clearInterval(this.screenCaptureAvailabilityWatcher);
+    }
+
+    // This is only a capture availability probe. desktopCapturer.getSources()
+    // cannot tell whether another app is currently sharing the screen.
+    this.screenCaptureAvailabilityWatcher = setInterval(async () => {
+      await this.checkScreenCaptureAvailability();
     }, 5000); // Check every 5 seconds instead of 1
 
-    logger.info('Screen sharing detection initialized');
+    logger.info('Screen capture availability watcher initialized');
   }
 
-  async checkScreenSharingStatus() {
+  async checkScreenCaptureAvailability() {
+    if (this.isCheckingScreenCaptureStatus) {
+      logger.debug('Skipping overlapping screen capture availability check');
+      return;
+    }
+
+    this.isCheckingScreenCaptureStatus = true;
+    const previousAvailability = this.screenCaptureStatus.available;
+    const checkedAt = new Date().toISOString();
+
     try {
-      const sources = await desktopCapturer.getSources({
+      await desktopCapturer.getSources({
         types: ['screen', 'window'],
         thumbnailSize: { width: 1, height: 1 }
       });
 
-      const wasSharing = this.isScreenBeingShared;
-      
-      if (wasSharing !== this.isScreenBeingShared) {
-        if (this.isScreenBeingShared) {
-          this.handleScreenSharingStarted();
-        } else {
-          this.handleScreenSharingStopped();
-        }
+      this.screenCaptureStatus = {
+        available: true,
+        lastError: null,
+        lastCheckedAt: checkedAt
+      };
+
+      if (previousAvailability === false) {
+        logger.info('Screen capture enumeration recovered');
       }
     } catch (error) {
-      logger.debug('Screen sharing detection error', { error: error.message });
+      this.screenCaptureStatus = {
+        available: false,
+        lastError: error.message,
+        lastCheckedAt: checkedAt
+      };
+
+      const logContext = {
+        error: error.message,
+        isScreenBeingShared: this.isScreenBeingShared
+      };
+
+      if (previousAvailability === false) {
+        logger.debug('Screen capture enumeration still unavailable', logContext);
+      } else {
+        logger.warn('Screen capture enumeration unavailable; leaving screen sharing mode unchanged', logContext);
+      }
+    } finally {
+      this.isCheckingScreenCaptureStatus = false;
     }
   }
 
@@ -866,7 +990,7 @@ class WindowManager {
   }
 
   handleScreenSharingStarted() {
-    logger.info('Screen sharing detected - hiding windows');
+    logger.info('Screen sharing mode enabled - hiding windows');
     
     this.windows.forEach((window, type) => {
       if (!window.isDestroyed()) {
@@ -877,7 +1001,7 @@ class WindowManager {
   }
 
   handleScreenSharingStopped() {
-    logger.info('Screen sharing ended - restoring windows');
+    logger.info('Screen sharing mode disabled - restoring windows');
     
     if (this.wasVisibleBeforeSharing) {
       this.moveWindowsToActiveScreen();
@@ -1216,6 +1340,43 @@ class WindowManager {
     }
   }
 
+  async showOnboarding() {
+    if (this.isScreenBeingShared) return null;
+
+    let onboardingWindow = this.windows.get('onboarding');
+    if (!onboardingWindow) {
+      onboardingWindow = await this.createWindow('onboarding');
+      this.windows.set('onboarding', onboardingWindow);
+
+      // Once the wizard renderer signals it's ready, send it the
+      // current first-run status so it can pre-populate correctly.
+      onboardingWindow.webContents.once('did-finish-load', () => {
+        logger.info('Onboarding window loaded');
+      });
+    }
+
+    this.showOnCurrentDesktop(onboardingWindow);
+    this.centerWindow(onboardingWindow);
+    onboardingWindow.focus();
+    logger.info('Onboarding window displayed');
+    return onboardingWindow;
+  }
+
+  hideOnboarding() {
+    const onboardingWindow = this.windows.get('onboarding');
+    if (onboardingWindow) {
+      onboardingWindow.hide();
+    }
+  }
+
+  closeOnboarding() {
+    const onboardingWindow = this.windows.get('onboarding');
+    if (onboardingWindow && !onboardingWindow.isDestroyed()) {
+      onboardingWindow.close();
+    }
+    this.windows.delete('onboarding');
+  }
+
   expandLLMWindow(contentMetrics = null) {
     const llmWindow = this.windows.get('llmResponse');
     if (!llmWindow || this.isScreenBeingShared) return;
@@ -1334,7 +1495,8 @@ class WindowManager {
       activeWindow: this.activeWindow,
       isInteractive: this.isInteractive,
       isVisible: this.isVisible,
-      isScreenBeingShared: this.isScreenBeingShared
+      isScreenBeingShared: this.isScreenBeingShared,
+      screenCaptureStatus: { ...this.screenCaptureStatus }
     };
   }
 
@@ -1359,9 +1521,9 @@ class WindowManager {
       this.desktopWatcher = null;
     }
 
-    if (this.screenSharingWatcher) {
-      clearInterval(this.screenSharingWatcher);
-      this.screenSharingWatcher = null;
+    if (this.screenCaptureAvailabilityWatcher) {
+      clearInterval(this.screenCaptureAvailabilityWatcher);
+      this.screenCaptureAvailabilityWatcher = null;
     }
     
     logger.info('All windows destroyed');

@@ -40,10 +40,33 @@ contextBridge.exposeInMainWorld('electronAPI', {
   hideSettings: () => ipcRenderer.invoke('hide-settings'),
   getSettings: () => ipcRenderer.invoke('get-settings'),
   saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
+
+  // First-run onboarding
+  getFirstRunStatus: () => ipcRenderer.invoke('get-first-run-status'),
+  completeFirstRun: () => ipcRenderer.invoke('complete-first-run'),
+  openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  closeOnboarding: () => ipcRenderer.invoke('close-onboarding'),
+  detectWhisper: () => ipcRenderer.invoke('detect-whisper'),
+  installWhisper: () => ipcRenderer.invoke('install-whisper'),
+  downloadWhisperModel: (modelName) => ipcRenderer.invoke('download-whisper-model', modelName),
+  onInstallProgress: (callback) => {
+    const wrapped = (_event, line) => {
+      try { callback(line); } catch (e) { console.error('onInstallProgress error:', e); }
+    };
+    ipcRenderer.on('install-progress', wrapped);
+    return () => ipcRenderer.removeListener('install-progress', wrapped);
+  },
   updateAppIcon: (iconKey) => ipcRenderer.invoke('update-app-icon', iconKey),
   updateActiveSkill: (skill) => ipcRenderer.invoke('update-active-skill', skill),
   restartAppForStealth: () => ipcRenderer.invoke('restart-app-for-stealth'),
   closeWindow: () => ipcRenderer.invoke('close-window'),
+  notifyMainWindowReady: () => {
+    try {
+      ipcRenderer.send('main-window-ready');
+    } catch (error) {
+      console.error('Error notifying main window ready:', error);
+    }
+  },
   quit: () => {
     try {
       ipcRenderer.send('quit-app');
@@ -91,6 +114,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onRecordingStarted: (callback) => ipcRenderer.on('recording-started', callback),
   onRecordingStopped: (callback) => ipcRenderer.on('recording-stopped', callback),
   onCodingLanguageChanged: (callback) => ipcRenderer.on('coding-language-changed', callback),
+  onMainWindowShown: (callback) => ipcRenderer.on('main-window-shown', callback),
   
   // Generic receive method
   receive: (channel, callback) => ipcRenderer.on(channel, callback),

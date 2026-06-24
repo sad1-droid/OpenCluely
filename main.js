@@ -1,8 +1,29 @@
 require("dotenv").config();
 
+const path = require("path");
 const { app, BrowserWindow, globalShortcut, session, ipcMain } = require("electron");
-const logger = require("./src/core/logger").createServiceLogger("MAIN");
-const config = require("./src/core/config");
+
+// ── Linux GPU process crash workaround ──
+// On many Linux setups (Wayland, X11 without GPU drivers, Docker, headless,
+// or systems with broken Mesa/NVIDIA stacks), Chromium's GPU process crashes
+// on startup with:
+//   FATAL:gpu_data_manager_impl_private.cc(448)] GPU process isn't usable.
+// This kills the entire app and can leave orphan helper processes that
+// exhaust the X11 client limit, producing "Maximum number of clients reached".
+//
+// Disabling hardware acceleration and the GPU subprocess forces Chromium to
+// render via the CPU (SwiftShader). OpenCluely's UI is light enough that
+// this is imperceptible, and it eliminates the GPU crash entirely.
+if (process.platform === "linux") {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-gpu");
+  app.commandLine.appendSwitch("disable-gpu-compositing");
+  app.commandLine.appendSwitch("disable-software-rasterizer");
+  app.commandLine.appendSwitch("disable-gpu-sandbox");
+  // On X11 only; harmless on Wayland. Prevents Chromium from spawning a
+  // compositor process that adds another X11 client.
+  app.commandLine.appendSwitch("in-process-gpu");
+}
 
 // Keep Chromium network noise out of the terminal; app-level logs still go through Winston.
 app.commandLine.appendSwitch("log-level", "3");
@@ -10,6 +31,10 @@ app.commandLine.appendSwitch("disable-background-networking");
 app.commandLine.appendSwitch("disable-component-update");
 app.commandLine.appendSwitch("disable-domain-reliability");
 app.commandLine.appendSwitch("no-pings");
+
+const logger = require("./src/core/logger").createServiceLogger("MAIN");
+const config = require("./src/core/config");
+const FirstRunManager = require("./src/core/first-run");
 
 // Services
 // Screen capture (image-based)
@@ -24,10 +49,25 @@ const sessionManager = require("./src/managers/session.manager");
 class ApplicationController {
   constructor() {
     this.isReady = false;
+    this.starting = false;
     this.activeSkill = "dsa";
   // Default to C++ so language is enforced from first run
   this.codingLanguage = "cpp";
     this.speechAvailable = false;
+
+    // First-run onboarding: detects missing .env / API key and triggers
+    // a settings-window prompt on first launch so users don't have to
+    // dig through docs to figure out they need a Gemini API key.
+    this.firstRunManager = new FirstRunManager({
+      logger: logger,
+      // Sentinel lives in userData so it survives cwd changes
+      // (the app may be launched from any directory).
+      sentinelPath: path.join(app.getPath("userData"), ".opencluely-firstrun-completed"),
+    });
+    // Lazily-initialised in getWhisperInstaller() so tests can mock
+    // the constructor without polluting main-process startup.
+    this._whisperInstaller = null;
+    this.isFirstRun = false;
 
     // Window configurations for reference
     this.windowConfigs = {
@@ -105,6 +145,12 @@ class ApplicationController {
   }
 
   async onAppReady() {
+    if (this.starting || this.isReady) {
+      logger.debug("onAppReady skipped: already starting or ready");
+      return;
+    }
+    this.starting = true;
+
     // Force stealth mode IMMEDIATELY when app is ready
     app.setName("Terminal ");
     process.title = "Terminal ";
@@ -124,13 +170,51 @@ class ApplicationController {
       // Small delay to ensure desktop/space detection is accurate
       await new Promise((resolve) => setTimeout(resolve, 200));
 
-      await windowManager.initializeWindows();
+      // First-run onboarding: ensure .env exists and read status once
+      // so we can decide whether to defer showing the main overlay.
+      let status;
+      try {
+        this.firstRunManager.ensureEnv();
+        status = this.firstRunManager.getStatus();
+        this.isFirstRun = status.needsOnboarding;
+        logger.info("First-run status", status);
+      } catch (e) {
+        logger.warn("First-run check failed", { error: e.message });
+        status = { needsOnboarding: false };
+        this.isFirstRun = false;
+      }
+      const isFirstRun = status.needsOnboarding;
+
+      await windowManager.initializeWindows({ showMainWindow: !isFirstRun });
       this.setupGlobalShortcuts();
 
       // Initialize default stealth mode with terminal icon
       this.updateAppIcon("terminal");
 
+      this.starting = false;
       this.isReady = true;
+
+      // Launch the onboarding wizard if this is the first run.
+      if (this.isFirstRun) {
+        // Defer slightly so all windows finish loading before we pop
+        // the wizard on top of them.
+        setTimeout(() => {
+          try {
+            windowManager.showOnboarding();
+            windowManager.broadcastToAllWindows("first-run", status);
+            logger.info("First-run onboarding: wizard opened");
+          } catch (e) {
+            logger.warn("Could not open first-run onboarding window", {
+              error: e.message
+            });
+            // Fallback to legacy settings prompt
+            try { this.showSettings(); } catch (_) { /* ignore */ }
+          }
+        }, 800);
+      } else {
+        // Already configured — mark completed so we never nag again.
+        this.firstRunManager.markCompleted();
+      }
 
       logger.info("Application initialized successfully", {
         windowCount: Object.keys(windowManager.getWindowStats().windows).length,
@@ -139,6 +223,7 @@ class ApplicationController {
 
       sessionManager.addEvent("Application started");
     } catch (error) {
+      this.starting = false;
       logger.error("Application initialization failed", {
         error: error.message,
       });
@@ -322,6 +407,20 @@ class ApplicationController {
       }, 1000);
     });
 
+    ipcMain.on("main-window-ready", () => {
+      // Re-check availability whenever the main overlay finishes loading;
+      // this covers first-run where the window was hidden during onboarding.
+      this.speechAvailable = speechService.isAvailable
+        ? speechService.isAvailable()
+        : false;
+      const { BrowserWindow } = require("electron");
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) {
+          win.webContents.send("speech-availability", { available: this.speechAvailable });
+        }
+      });
+    });
+
     ipcMain.on("test-chat-window", () => {
       windowManager.broadcastToAllWindows("transcription-received", {
         text: "🧪 IMMEDIATE TEST: Chat window IPC communication test successful!",
@@ -418,12 +517,15 @@ class ApplicationController {
       // Add chat message to session memory
       sessionManager.addUserInput(text, 'chat');
       logger.debug('Chat message added to session memory', { textLength: text.length });
-      
-      // Process typed message with LLM in the same way as transcribed text
+
+      // Typed messages need the full skill pipeline (with history context),
+      // NOT the voice "intelligent filter" pipeline. Voice keeps its filter
+      // behaviour; typed chat goes through processWithLLM so it gets real
+      // answers using the active skill prompt and recent conversation history.
       setTimeout(async () => {
         try {
           const sessionHistory = sessionManager.getOptimizedHistory();
-          await this.processTranscriptionWithLLM(text, sessionHistory);
+          await this.processWithLLM(text, sessionHistory);
         } catch (error) {
           logger.error("Failed to process chat message with LLM", {
             error: error.message,
@@ -431,7 +533,7 @@ class ApplicationController {
           });
         }
       }, 500);
-      
+
       return { success: true };
     });
 
@@ -523,6 +625,115 @@ class ApplicationController {
 
     ipcMain.handle("get-settings", () => {
       return this.getSettings();
+    });
+
+    // First-run onboarding status — renderer can query to know whether
+    // to show the welcome banner / prompt for API-key entry.
+    ipcMain.handle("get-first-run-status", () => {
+      try {
+        return this.firstRunManager.getStatus();
+      } catch (e) {
+        logger.warn("Failed to get first-run status", { error: e.message });
+        return { needsOnboarding: false, error: e.message };
+      }
+    });
+
+    ipcMain.handle("complete-first-run", async () => {
+      try {
+        this.firstRunManager.markCompleted();
+        this.isFirstRun = false;
+        // Reinitialize speech service with the latest persisted settings
+        // so the mic button reflects the provider/command set during onboarding.
+        speechService.initializeClient();
+        this.speechAvailable = speechService.isAvailable
+          ? speechService.isAvailable()
+          : false;
+        // Show the main overlay window now that onboarding is done
+        // and API keys are configured.
+        await windowManager.showMainWindow();
+        // Broadcast speech availability so the mic button appears
+        const { BrowserWindow } = require("electron");
+        BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed()) {
+            win.webContents.send("speech-availability", { available: this.speechAvailable });
+          }
+        });
+        return { success: true };
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
+    });
+
+    // Open a URL in the system browser (used by the GitHub star button
+    // in onboarding).
+    ipcMain.handle("open-external", async (_event, url) => {
+      try {
+        if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+          return { ok: false, error: "Invalid URL" };
+        }
+        const { shell } = require("electron");
+        await shell.openExternal(url);
+        return { ok: true };
+      } catch (e) {
+        logger.warn("Failed to open external URL", { url, error: e.message });
+        return { ok: false, error: e.message };
+      }
+    });
+
+    // Close the onboarding wizard window.
+    ipcMain.handle("close-onboarding", () => {
+      try {
+        windowManager.closeOnboarding();
+        return { success: true };
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
+    });
+
+    // Detect an installed Whisper CLI across common locations.
+    ipcMain.handle("detect-whisper", async () => {
+      try {
+        const installer = this.getWhisperInstaller();
+        return await installer.detect();
+      } catch (e) {
+        logger.warn("Whisper detection failed", { error: e.message });
+        return { found: false, command: null, version: null, error: e.message };
+      }
+    });
+
+    // Install Whisper. Streams progress lines back via `webContents.send`
+    // so the renderer can paint them as they arrive.
+    ipcMain.handle("install-whisper", async (event) => {
+      try {
+        const installer = this.getWhisperInstaller();
+        const sender = event.sender;
+        const result = await installer.install({
+          onProgress: (line) => {
+            try { sender.send("install-progress", line); } catch (_) { /* ignore */ }
+          },
+        });
+        return result;
+      } catch (e) {
+        logger.error("Whisper install failed", { error: e.message });
+        return { ok: false, command: null, message: e.message, logs: "" };
+      }
+    });
+
+    // Download Whisper model. Streams progress lines back via `webContents.send`
+    ipcMain.handle("download-whisper-model", async (event, modelName) => {
+      try {
+        const installer = this.getWhisperInstaller();
+        const sender = event.sender;
+        const result = await installer.downloadModel(modelName || 'turbo', {
+          onProgress: (line) => {
+            try { sender.send("install-progress", line); } catch (_) { /* ignore */ }
+          },
+        });
+        return result;
+      } catch (e) {
+        logger.error("Whisper model download failed", { error: e.message });
+        return { ok: false, message: e.message, path: null };
+      }
     });
 
     ipcMain.handle("save-settings", (event, settings) => {
@@ -926,6 +1137,16 @@ class ApplicationController {
       // Send response to chat windows
       this.broadcastTranscriptionLLMResponse(llmResult);
 
+      // Also display in the overlay (LLM response) window so the answer
+      // appears in both the chat panel and the floating overlay, mirroring
+      // the behaviour of screenshot/image responses.
+      windowManager.showLLMResponse(llmResult.response, {
+        skill: this.activeSkill,
+        processingTime: llmResult.metadata.processingTime,
+        usedFallback: llmResult.metadata.usedFallback,
+        isTranscriptionResponse: true
+      });
+
       logger.info("Transcription LLM response completed", {
         responseLength: llmResult.response.length,
         skill: this.activeSkill,
@@ -944,7 +1165,7 @@ class ApplicationController {
       // Try to provide a fallback response
       try {
         const fallbackResult = llmService.generateIntelligentFallbackResponse(text, this.activeSkill);
-        
+
         sessionManager.addModelResponse(fallbackResult.response, {
           skill: this.activeSkill,
           processingTime: fallbackResult.metadata.processingTime,
@@ -954,7 +1175,13 @@ class ApplicationController {
         });
 
         this.broadcastTranscriptionLLMResponse(fallbackResult);
-        
+        // Mirror to overlay window for consistency
+        windowManager.showLLMResponse(fallbackResult.response, {
+          skill: this.activeSkill,
+          processingTime: fallbackResult.metadata.processingTime,
+          usedFallback: true,
+          isTranscriptionResponse: true
+        });
         logger.info("Used fallback response for transcription", {
           skill: this.activeSkill,
           fallbackResponse: fallbackResult.response
@@ -1040,9 +1267,9 @@ class ApplicationController {
   }
 
   onActivate() {
-    if (!this.isReady) {
+    if (!this.isReady && !this.starting) {
       this.onAppReady();
-    } else {
+    } else if (this.isReady) {
       // When app is activated, ensure windows appear on current desktop
       const mainWindow = windowManager.getWindow("main");
       if (mainWindow && mainWindow.isVisible()) {
@@ -1071,31 +1298,56 @@ class ApplicationController {
     });
   }
 
+  getWhisperInstaller() {
+    if (!this._whisperInstaller) {
+      const WhisperInstaller = require("./src/core/whisper-installer");
+      const { app } = require("electron");
+      this._whisperInstaller = new WhisperInstaller({
+        cwd: process.cwd(),
+        dataDir: app.getPath("userData"),
+        platform: process.platform,
+      });
+    }
+    return this._whisperInstaller;
+  }
+
   getSettings() {
+    // Surface every value the settings UI can edit, reading the live source
+    // of truth (process.env) so the UI shows exactly what the running app is
+    // using. Empty strings are returned rather than skipped so the UI can
+    // distinguish "unset" from "stale value from a previous load".
     return {
-      codingLanguage: this.codingLanguage || "cpp", // Default to C++
+      codingLanguage: this.codingLanguage || "cpp",
       activeSkill: this.activeSkill || "dsa",
       appIcon: this.appIcon || "terminal",
       selectedIcon: this.appIcon || "terminal",
-      // pass through env-derived settings for UI convenience (masked)
+      windowGap: windowManager.windowGap,
+
+      speechProvider: speechService.provider || "whisper",
+      azureKey: process.env.AZURE_SPEECH_KEY || "",
+      azureRegion: process.env.AZURE_SPEECH_REGION || "",
+      whisperCommand: process.env.WHISPER_COMMAND || "",
+      whisperModel: process.env.WHISPER_MODEL || "turbo",
+      whisperLanguage: process.env.WHISPER_LANGUAGE || "en",
+      whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
+      geminiKey: process.env.GEMINI_API_KEY || "",
+
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
       speechAvailable: this.speechAvailable
     };
   }
-  
+
   saveSettings(settings) {
     try {
-      // Update application settings
+      // ── In-memory updates + window broadcasts ──
       if (settings.codingLanguage) {
         this.codingLanguage = settings.codingLanguage;
-        // Broadcast language change to all windows for sync
         windowManager.broadcastToAllWindows("coding-language-changed", {
           language: settings.codingLanguage,
         });
       }
       if (settings.activeSkill) {
         this.activeSkill = settings.activeSkill;
-        // Broadcast skill change to all windows
         windowManager.broadcastToAllWindows("skill-updated", {
           skill: settings.activeSkill,
         });
@@ -1103,19 +1355,104 @@ class ApplicationController {
       if (settings.appIcon) {
         this.appIcon = settings.appIcon;
       }
-
-      // Handle icon change specifically
       if (settings.selectedIcon) {
         this.appIcon = settings.selectedIcon;
-        // Immediately update the app icon
         this.updateAppIcon(settings.selectedIcon);
       }
+      if (settings.windowGap !== undefined) {
+        const gap = Number(settings.windowGap);
+        if (Number.isFinite(gap)) windowManager.setWindowGap(gap);
+      }
 
-      // Persist settings to file or config
-      this.persistSettings(settings);
+      // ── Persist provider / API-key fields back to .env ──
+      // The settings UI is now the source of truth for these values.
+      // Writing to .env ensures they survive app restarts and are picked
+      // up the next time the app boots.
+      const envUpdates = {};
+      if (settings.speechProvider === "azure" || settings.speechProvider === "whisper") {
+        envUpdates.SPEECH_PROVIDER = settings.speechProvider;
+      }
+      if (settings.azureKey !== undefined) {
+        envUpdates.AZURE_SPEECH_KEY = settings.azureKey;
+      }
+      if (settings.azureRegion !== undefined) {
+        envUpdates.AZURE_SPEECH_REGION = settings.azureRegion;
+      }
+      if (settings.whisperCommand !== undefined) {
+        envUpdates.WHISPER_COMMAND = settings.whisperCommand;
+      }
+      if (settings.whisperModel !== undefined) {
+        envUpdates.WHISPER_MODEL = settings.whisperModel;
+      }
+      if (settings.whisperLanguage !== undefined) {
+        envUpdates.WHISPER_LANGUAGE = settings.whisperLanguage;
+      }
+      if (settings.whisperSegmentMs !== undefined) {
+        envUpdates.WHISPER_SEGMENT_MS = String(settings.whisperSegmentMs);
+      }
+      if (settings.geminiKey !== undefined) {
+        envUpdates.GEMINI_API_KEY = settings.geminiKey;
+      }
 
-      logger.info("Settings saved successfully", settings);
-      return { success: true };
+      const persistedKeys = this.persistEnvUpdates(envUpdates);
+
+      // If the Gemini key was just saved, reinitialize the LLM service
+      // so the new client picks up the key. Without this, the test-
+      // connection button in the onboarding wizard fails with
+      // "Service not initialized" because the client was first created
+      // at app startup, before any key was set.
+      if (settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) {
+        try {
+          llmService.initializeClient();
+          logger.info("LLM service reinitialized after Gemini key update");
+        } catch (e) {
+          logger.warn("Failed to reinitialize LLM service after Gemini key update", {
+            error: e.message
+          });
+        }
+      }
+
+      // Reinitialize speech service when provider OR whisper command
+      // changes. Without the second check, the install flow (which
+      // writes a new whisperCommand after install but keeps the same
+      // provider) would leave the speech service pointing at a stale
+      // (or non-existent) binary, and the main overlay's mic button
+      // would stay hidden / non-functional.
+      const providerChanged = settings.speechProvider && speechService.provider !== settings.speechProvider;
+      const whisperCommandChanged = settings.whisperCommand !== undefined &&
+        (process.env.WHISPER_COMMAND || '') !== String(settings.whisperCommand || '');
+      if (providerChanged || whisperCommandChanged) {
+        try {
+          speechService.initializeClient();
+          this.speechAvailable = speechService.isAvailable
+            ? speechService.isAvailable()
+            : false;
+          // Broadcast so any open window (settings, overlay, chat)
+          // can react immediately — especially the main overlay's
+          // mic button, which queries availability on load.
+          const { BrowserWindow } = require("electron");
+          BrowserWindow.getAllWindows().forEach((win) => {
+            if (!win.isDestroyed()) {
+              win.webContents.send("speech-availability", { available: this.speechAvailable });
+            }
+          });
+          logger.info('Speech service reinitialized after settings change', {
+            providerChanged,
+            whisperCommandChanged,
+            speechAvailable: this.speechAvailable,
+          });
+        } catch (e) {
+          logger.warn("Failed to reinitialize speech service after settings change", {
+            error: e.message
+          });
+        }
+      }
+
+      logger.info("Settings saved successfully", {
+        ...settings,
+        persistedEnvKeys: persistedKeys
+      });
+      return { success: true, persistedEnvKeys: persistedKeys };
     } catch (error) {
       logger.error("Failed to save settings", { error: error.message });
       return { success: false, error: error.message };
@@ -1126,6 +1463,83 @@ class ApplicationController {
     // You can extend this to save to a file or database
     // For now, we'll just keep them in memory
     logger.debug("Settings persisted", settings);
+  }
+
+  /**
+   * Write key=value pairs to the project's .env file. Existing keys are
+   * replaced in-place; new keys are appended. Comments and unrelated lines
+   * are preserved. Uses an atomic write (temp file + rename) so a crash
+   * mid-write cannot corrupt .env.
+   *
+   * @param {Object<string, string>} updates - keys to upsert
+   * @returns {string[]} keys that were actually persisted
+   */
+  persistEnvUpdates(updates) {
+    if (!updates || typeof updates !== "object") return [];
+    const keys = Object.keys(updates);
+    if (keys.length === 0) return [];
+
+    const fs = require("fs");
+    const path = require("path");
+    const envPath = path.join(process.cwd(), ".env");
+
+    let existing = "";
+    try {
+      existing = fs.readFileSync(envPath, "utf8");
+    } catch (_) {
+      // .env doesn't exist yet — we'll create one from scratch
+      existing = "";
+    }
+
+    const existingLines = existing.length > 0 ? existing.split(/\r?\n/) : [];
+    const updated = new Set();
+    const outLines = [];
+
+    for (const line of existingLines) {
+      // Match "KEY=" (with optional whitespace) but skip comment lines
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=/);
+      if (m && Object.prototype.hasOwnProperty.call(updates, m[1])) {
+        const key = m[1];
+        // Escape any embedded newlines/backslashes in the value so the
+        // resulting .env line is single-line and parseable.
+        const value = String(updates[key]).replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
+        outLines.push(`${key}=${value}`);
+        updated.add(key);
+      } else {
+        outLines.push(line);
+      }
+    }
+
+    // Append any keys that weren't already present
+    for (const key of keys) {
+      if (!updated.has(key)) {
+        const value = String(updates[key]).replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
+        outLines.push(`${key}=${value}`);
+        updated.add(key);
+      }
+    }
+
+    // Update process.env so the running app picks up the new values
+    // immediately (and so the settings UI reads the same source of truth).
+    for (const key of keys) {
+      process.env[key] = String(updates[key]);
+    }
+
+    const newContent = outLines.join("\n");
+    try {
+      const tmpPath = envPath + ".tmp";
+      fs.writeFileSync(tmpPath, newContent, "utf8");
+      fs.renameSync(tmpPath, envPath);
+    } catch (e) {
+      logger.error("Failed to persist .env updates", {
+        error: e.message,
+        keys
+      });
+      return [];
+    }
+
+    logger.info("Persisted .env updates", { keys: Array.from(updated) });
+    return Array.from(updated);
   }
 
   updateAppIcon(iconKey) {
@@ -1156,7 +1570,7 @@ class ApplicationController {
         return { success: false, error: "Invalid icon key" };
       }
 
-      const fullIconPath = path.resolve(iconPath);
+      const fullIconPath = path.resolve(__dirname, iconPath);
 
       if (!fs.existsSync(fullIconPath)) {
         logger.error("Icon file not found", {
@@ -1241,7 +1655,7 @@ class ApplicationController {
           // Force dock refresh
           setTimeout(() => {
             app.dock.setIcon(
-              require("path").resolve(`assests/icons/${iconKey}.png`)
+              require("path").resolve(__dirname, `assests/icons/${iconKey}.png`)
             );
           }, 50);
         }

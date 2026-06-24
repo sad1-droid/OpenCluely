@@ -40,7 +40,11 @@ class ConfigManager {
 
       llm: {
         gemini: {
-          model: 'gemini-2.5-flash',
+          // 'gemini-3.5-flash' is Google's current stable Flash model.
+          // 'gemini-3-flash-preview' is the fallback because it also has a
+          // free tier and is less likely to hit demand spikes.
+          model: 'gemini-3.5-flash',
+          fallbackModels: ['gemini-3-flash-preview', 'gemini-2.5-flash'],
           maxRetries: 3,
           timeout: 60000,
           fallbackEnabled: true,
@@ -63,7 +67,7 @@ class ConfigManager {
           outputFormat: 'detailed'
         },
         whisper: {
-          model: 'base',
+          model: 'turbo',
           language: 'en',
           segmentMs: 4000
         }
