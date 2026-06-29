@@ -423,6 +423,7 @@ class SpeechService extends EventEmitter {
     this.pendingFlush = false;
     this.audioProgram = null;
     this.whisperCommand = null;
+    this._resetVadState();
 
     this.initializeClient();
   }
@@ -507,10 +508,6 @@ class SpeechService extends EventEmitter {
 
   _initializeWhisperClient() {
     try {
-      if (!recorder || typeof recorder.record !== 'function') {
-        throw new Error('Local microphone recorder dependency is not installed');
-      }
-
       this.whisperCommand = this._resolveWhisperCommand();
       if (!this.whisperCommand) {
         const reason = 'Local Whisper unavailable. Install the Whisper CLI or set WHISPER_COMMAND.';
@@ -677,20 +674,231 @@ class SpeechService extends EventEmitter {
     this.segmentBytes = 0;
     this.transcriptionInFlight = false;
     this.pendingFlush = false;
+    this._resetVadState();
     this.emit('recording-started');
     this.emit('status', 'Local Whisper recording started');
-    this._startMicrophoneCapture();
 
-    const segmentMs = this._getWhisperSegmentMs();
-    this.segmentTimer = setInterval(() => {
-      this._flushWhisperSegment({ final: false }).catch((error) => {
-        logger.error('Whisper segment transcription failed', { error: error.message });
-      });
-    }, segmentMs);
+    // Capture microphone audio in the renderer via the Web Audio API on Windows
+    // and macOS. Windows lacks the Unix sox/rec/arecord tools node-record-lpcm16
+    // needs; macOS would otherwise require a Homebrew `sox` install (not bundled)
+    // and a child-process mic that the system TCC prompt can't attribute. The
+    // renderer path uses getUserMedia, which macOS prompts for cleanly via the
+    // app's NSMicrophoneUsageDescription. Linux keeps the native recorder path.
+    this.useRendererCapture = process.platform === 'win32' || process.platform === 'darwin';
+    if (this.useRendererCapture) {
+      this.emit('status', 'Waiting for microphone audio…');
+      // The renderer starts sending chunks once it receives the recording-started event.
+      this._startSegmentWatchdog();
+      if (global.windowManager) {
+        global.windowManager.handleRecordingStarted();
+      }
+      return;
+    }
+
+    this._startMicrophoneCapture();
+    this._startSegmentWatchdog();
 
     if (global.windowManager) {
       global.windowManager.handleRecordingStarted();
     }
+  }
+
+  /**
+   * Reset the voice-activity-detection state machine. VAD replaces the old
+   * fixed-interval segmentation: instead of cutting audio every N seconds
+   * (which split sentences mid-word and transcribed silent windows), we
+   * accumulate audio while the user is speaking and flush a segment once a
+   * natural pause is detected. State is intentionally simple so it works for
+   * both the renderer (Web Audio) and native (sox/arecord) capture paths.
+   */
+  _resetVadState() {
+    this.vadSpeaking = false;        // currently inside an utterance
+    this.vadSpeechMs = 0;            // accumulated voiced audio in this segment
+    this.vadSilenceMs = 0;           // trailing silence since last voiced chunk
+    this.vadNoiseFloor = 0;          // adaptive EMA of background energy
+    this.vadNoiseInit = false;       // has the noise floor been seeded
+    this.vadPreRoll = [];            // ring of recent pre-speech chunks
+    this.vadPreRollMs = 0;           // duration held in the pre-roll ring
+    this.vadLastChunkAt = 0;         // timestamp of the last ingested chunk
+  }
+
+  /**
+   * Lightweight watchdog. Silence is normally detected from incoming chunks
+   * (which keep flowing at low energy), but if the capture pipeline stalls
+   * mid-utterance we still want to flush what we have. The watchdog also
+   * enforces the max-utterance cap as a backstop.
+   */
+  _startSegmentWatchdog() {
+    if (this.segmentTimer) {
+      clearInterval(this.segmentTimer);
+    }
+    this.segmentTimer = setInterval(() => {
+      if (!this.isRecording || this.provider !== 'whisper') {
+        return;
+      }
+
+      // VAD disabled (fallback): preserve the legacy fixed-window behaviour by
+      // flushing once the accumulated audio reaches the configured segment size.
+      if (!this._isVadEnabled()) {
+        if (this.segmentBytes && this.vadSpeechMs >= this._getWhisperSegmentMs()) {
+          this._endUtteranceFlush();
+        }
+        return;
+      }
+
+      // If we're mid-utterance and no audio has arrived recently, the mic may
+      // have stalled — flush what we captured rather than holding it forever.
+      const sinceLastChunk = this.vadLastChunkAt ? Date.now() - this.vadLastChunkAt : 0;
+      const stalled = this.vadSpeaking && sinceLastChunk > 1500;
+      const tooLong = this.vadSpeaking && this.vadSpeechMs >= this._getMaxUtteranceMs();
+      if (stalled || tooLong) {
+        this._endUtteranceFlush();
+      }
+    }, 500);
+  }
+
+  /**
+   * Receive raw 16kHz mono 16-bit PCM audio from the renderer and add it to
+   * the current Whisper segment buffer.
+   */
+  handleAudioChunkFromRenderer(chunk) {
+    if (!this.isRecording || this.provider !== 'whisper' || !this.useRendererCapture) {
+      return;
+    }
+    if (!chunk || !chunk.length) {
+      return;
+    }
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    this._ingestWhisperAudio(buffer);
+  }
+
+  /**
+   * Compute the RMS energy (normalized to 0..1) of a 16-bit little-endian PCM
+   * buffer. Used as the voice-activity signal.
+   */
+  _chunkRmsEnergy(buffer) {
+    const sampleCount = Math.floor(buffer.length / 2);
+    if (sampleCount === 0) {
+      return 0;
+    }
+    let sumSquares = 0;
+    for (let i = 0; i < sampleCount; i++) {
+      const sample = buffer.readInt16LE(i * 2) / 32768;
+      sumSquares += sample * sample;
+    }
+    return Math.sqrt(sumSquares / sampleCount);
+  }
+
+  /**
+   * Single ingest path for both capture backends. Runs the VAD state machine:
+   * accumulate audio while the user speaks, and flush the segment to Whisper
+   * once a natural pause (trailing silence) is detected. Falls back to plain
+   * buffering when VAD is disabled.
+   */
+  _ingestWhisperAudio(buffer) {
+    if (!buffer || !buffer.length) {
+      return;
+    }
+
+    if (!this._isVadEnabled()) {
+      // Legacy behaviour: the watchdog/max-utterance cap drives flushing.
+      this.segmentBuffers.push(buffer);
+      this.segmentBytes += buffer.length;
+      this.vadSpeaking = true;
+      this.vadSpeechMs += this._chunkDurationMs(buffer);
+      this.vadLastChunkAt = Date.now();
+      return;
+    }
+
+    this.vadLastChunkAt = Date.now();
+    const chunkMs = this._chunkDurationMs(buffer);
+    const energy = this._chunkRmsEnergy(buffer);
+
+    // Seed / adapt the background noise floor while not actively speaking so
+    // the threshold tracks the room rather than a hard-coded constant.
+    if (!this.vadNoiseInit) {
+      this.vadNoiseFloor = energy;
+      this.vadNoiseInit = true;
+    }
+    const floor = this._getVadEnergyFloor();
+    // Hysteresis: it takes more energy to *start* an utterance than to keep
+    // one going, so a brief dip mid-sentence doesn't end it prematurely.
+    const enterThreshold = Math.max(floor, this.vadNoiseFloor * 2.5);
+    const exitThreshold = Math.max(floor * 0.7, this.vadNoiseFloor * 1.6);
+    const isVoiced = this.vadSpeaking ? energy >= exitThreshold : energy >= enterThreshold;
+
+    if (!this.vadSpeaking) {
+      if (isVoiced) {
+        // Speech onset: prepend the pre-roll so the first syllable survives.
+        this.vadSpeaking = true;
+        this.vadSpeechMs = 0;
+        this.vadSilenceMs = 0;
+        for (const pre of this.vadPreRoll) {
+          this.segmentBuffers.push(pre);
+          this.segmentBytes += pre.length;
+        }
+        this.vadPreRoll = [];
+        this.vadPreRollMs = 0;
+        this.segmentBuffers.push(buffer);
+        this.segmentBytes += buffer.length;
+        this.vadSpeechMs += chunkMs;
+      } else {
+        // Background: adapt the noise floor and keep a short pre-roll ring.
+        this.vadNoiseFloor = this.vadNoiseFloor * 0.95 + energy * 0.05;
+        this.vadPreRoll.push(buffer);
+        this.vadPreRollMs += chunkMs;
+        const preRollLimit = this._getPreRollMs();
+        while (this.vadPreRollMs > preRollLimit && this.vadPreRoll.length > 1) {
+          const dropped = this.vadPreRoll.shift();
+          this.vadPreRollMs -= this._chunkDurationMs(dropped);
+        }
+      }
+      return;
+    }
+
+    // Already speaking: keep capturing (including trailing silence so word
+    // endings aren't clipped) and watch for a pause that ends the utterance.
+    this.segmentBuffers.push(buffer);
+    this.segmentBytes += buffer.length;
+    if (isVoiced) {
+      this.vadSpeechMs += chunkMs;
+      this.vadSilenceMs = 0;
+    } else {
+      this.vadSilenceMs += chunkMs;
+    }
+
+    const pausedLongEnough = this.vadSilenceMs >= this._getSilenceHangoverMs();
+    const haveRealSpeech = this.vadSpeechMs >= this._getMinUtteranceMs();
+    const tooLong = this.vadSpeechMs >= this._getMaxUtteranceMs();
+
+    if ((pausedLongEnough && haveRealSpeech) || tooLong) {
+      this._endUtteranceFlush();
+    } else if (pausedLongEnough && !haveRealSpeech) {
+      // Just noise (cough/click) with no real speech — discard, don't waste a
+      // Whisper spawn or risk a hallucinated transcript.
+      this.segmentBuffers = [];
+      this.segmentBytes = 0;
+      this.vadSpeaking = false;
+      this.vadSpeechMs = 0;
+      this.vadSilenceMs = 0;
+    }
+  }
+
+  /** Flush the accumulated utterance and reset VAD for the next one. */
+  _endUtteranceFlush() {
+    this.vadSpeaking = false;
+    this.vadSpeechMs = 0;
+    this.vadSilenceMs = 0;
+    this.vadPreRoll = [];
+    this.vadPreRollMs = 0;
+    this._flushWhisperSegment({ final: false }).catch((error) => {
+      logger.error('Whisper segment transcription failed', { error: error.message });
+    });
+  }
+
+  _chunkDurationMs(buffer) {
+    // 16kHz mono 16-bit => 2 bytes/sample => 32 bytes/ms.
+    return buffer.length / 32;
   }
 
   stopRecording() {
@@ -815,7 +1023,9 @@ class SpeechService extends EventEmitter {
     this.segmentBytes = 0;
     this.transcriptionInFlight = false;
     this.pendingFlush = false;
+    this._resetVadState();
     this._audioDataLogged = false;
+    this.useRendererCapture = false;
   }
 
   async recognizeFromFile(audioFilePath) {
@@ -974,7 +1184,28 @@ class SpeechService extends EventEmitter {
   }
 
   _getWhisperModelDir() {
-    return this._getSetting('whisperModelDir') || process.env.WHISPER_MODEL_DIR || '';
+    const configured = this._getSetting('whisperModelDir') || process.env.WHISPER_MODEL_DIR || '';
+    // Honor an absolute configured dir. Empty or relative values (the old
+    // `.whisper-models` default resolved against an unstable cwd) are replaced
+    // with the stable userData location the installer downloads weights into,
+    // so --model_dir and download_root always agree.
+    if (configured && path.isAbsolute(configured)) {
+      return configured;
+    }
+    return this._getUserDataModelDir() || configured;
+  }
+
+  /**
+   * Absolute model-weights dir under Electron userData — matches
+   * WhisperInstaller.modelDir so transcription finds downloaded models.
+   */
+  _getUserDataModelDir() {
+    try {
+      const { app } = require('electron');
+      return path.join(app.getPath('userData'), '.whisper-models');
+    } catch (_) {
+      return '';
+    }
   }
 
   _getWhisperLanguage() {
@@ -985,6 +1216,42 @@ class SpeechService extends EventEmitter {
     const rawValue = this._getSetting('whisperSegmentMs') || process.env.WHISPER_SEGMENT_MS || config.get('speech.whisper.segmentMs') || 4000;
     const parsed = Number(rawValue);
     return Number.isFinite(parsed) ? Math.max(2000, parsed) : 4000;
+  }
+
+  _vadNumber(settingKey, envKey, configPath, fallback, min) {
+    const raw = this._getSetting(settingKey) || process.env[envKey] || config.get(configPath) || fallback;
+    const parsed = Number(raw);
+    const value = Number.isFinite(parsed) ? parsed : fallback;
+    return typeof min === 'number' ? Math.max(min, value) : value;
+  }
+
+  _isVadEnabled() {
+    const override = this._getSetting('whisperVadEnabled');
+    if (override === false || override === 'false') return false;
+    if (override === true || override === 'true') return true;
+    if (process.env.WHISPER_VAD_ENABLED === 'false') return false;
+    const configured = config.get('speech.whisper.vadEnabled');
+    return configured !== false;
+  }
+
+  _getSilenceHangoverMs() {
+    return this._vadNumber('whisperSilenceHangoverMs', 'WHISPER_SILENCE_HANGOVER_MS', 'speech.whisper.silenceHangoverMs', 700, 200);
+  }
+
+  _getMinUtteranceMs() {
+    return this._vadNumber('whisperMinUtteranceMs', 'WHISPER_MIN_UTTERANCE_MS', 'speech.whisper.minUtteranceMs', 350, 100);
+  }
+
+  _getMaxUtteranceMs() {
+    return this._vadNumber('whisperMaxUtteranceMs', 'WHISPER_MAX_UTTERANCE_MS', 'speech.whisper.maxUtteranceMs', 15000, 2000);
+  }
+
+  _getPreRollMs() {
+    return this._vadNumber('whisperPreRollMs', 'WHISPER_PRE_ROLL_MS', 'speech.whisper.preRollMs', 300, 0);
+  }
+
+  _getVadEnergyFloor() {
+    return this._vadNumber('whisperVadEnergyFloor', 'WHISPER_VAD_ENERGY_FLOOR', 'speech.whisper.vadEnergyFloor', 0.008, 0.0005);
   }
 
   _getSetting(key) {
@@ -1057,7 +1324,42 @@ class SpeechService extends EventEmitter {
   }
 
   /**
-   * Probe a single candidate: exists check → spawn --help → validate output.
+   * Fast, torch-free check for python `-m whisper` candidates. Importing the
+   * whisper package pulls in torch/numba and can take well over 8 s on a cold
+   * cache (first run after install), which made `--help` time out and the mic
+   * button stay hidden until a second launch. `importlib.util.find_spec`
+   * confirms the module is installed without importing it, returning in well
+   * under a second. Returns the candidate on success, else null.
+   */
+  _probeWhisperModuleFast(candidate) {
+    const mIdx = candidate.baseArgs.indexOf('-m');
+    if (mIdx === -1 || candidate.baseArgs[mIdx + 1] !== 'whisper') {
+      return null; // not a `-m whisper` form (e.g. a whisper binary)
+    }
+    const pyArgs = candidate.baseArgs.slice(0, mIdx);
+    const script = 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("whisper") else 1)';
+    try {
+      // No shell: an absolute .exe runs directly. shell:true on Windows does
+      // NOT quote args, so a spaced path like
+      //   C:\Users\CANDAN SINGH\...\python.exe
+      // would be split at the space and the probe would wrongly fail —
+      // hiding the mic for any user whose profile name contains a space.
+      const probe = spawnSync(candidate.command, [...pyArgs, '-c', script], {
+        encoding: 'utf8',
+        timeout: 8000,
+        windowsHide: true,
+      });
+      if (!probe.error && probe.status === 0) {
+        return candidate;
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  /**
+   * Probe a single candidate: exists check → fast module check → spawn --help.
    * Returns the working candidate object, or null on failure.
    */
   _probeWhisperCandidate(candidate) {
@@ -1081,13 +1383,22 @@ class SpeechService extends EventEmitter {
       }
     }
 
+    // Cheap torch-free check first so the mic appears on the first run.
+    const fast = this._probeWhisperModuleFast(candidate);
+    if (fast) {
+      logger.debug('Whisper module confirmed via find_spec', { command: cmd });
+      return fast;
+    }
+
     let probe;
     try {
       probe = spawnSync(cmd, args, {
         encoding: 'utf8',
-        timeout: 8000,
-        // On Windows, some relative paths with forward slashes need shell:true
-        shell: process.platform === 'win32' && (cmd.includes('/') || cmd.includes('\\'))
+        // First `import whisper` (torch/numba) can be slow on a cold cache.
+        timeout: 30000,
+        windowsHide: true,
+        // No shell — see _probeWhisperModuleFast: shell:true on Windows splits
+        // spaced paths (e.g. "C:\Users\CANDAN SINGH\...") and breaks the probe.
       });
     } catch (spawnErr) {
       logger.debug('Whisper probe spawn error', {
@@ -1184,14 +1495,21 @@ class SpeechService extends EventEmitter {
   }
 
   _parseCommand(rawCommand) {
-    const parts = String(rawCommand || '').trim().split(/\s+/).filter(Boolean);
-    if (parts.length === 0) {
+    // Respect double-quoted segments so Windows userData paths like
+    // "C:\Users\CANDAN SINGH\...\python.exe" survive intact.
+    const trimmed = String(rawCommand || '').trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parts = trimmed.match(/(?:[^\s"]+|"[^"]*")+/g) || [trimmed];
+    const normalized = parts.map((p) => p.replace(/^"|"$/g, '')).filter(Boolean);
+    if (normalized.length === 0) {
       return null;
     }
 
     return {
-      command: parts[0],
-      baseArgs: parts.slice(1)
+      command: normalized[0],
+      baseArgs: normalized.slice(1)
     };
   }
 
@@ -1201,31 +1519,96 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    this._startMicrophoneCaptureWithFallback(['sox', 'rec', 'arecord']);
+    // node-record-lpcm16 only ships two recorder modules: `sox` and `arecord`.
+    // `recorder` is the option it actually reads (the old `recordProgram` name
+    // was silently ignored, so every attempt fell back to sox). Each entry maps
+    // the recorder module to the binary we must verify is on PATH.
+    //   - macOS: sox (via Homebrew)
+    //   - Linux: arecord (ALSA, usually preinstalled) then sox
+    const candidates = process.platform === 'darwin'
+      ? [{ recorder: 'sox', bin: 'sox' }]
+      : [{ recorder: 'arecord', bin: 'arecord' }, { recorder: 'sox', bin: 'sox' }];
+    this._startMicrophoneCaptureWithFallback(candidates);
   }
 
-  _startMicrophoneCaptureWithFallback(programs) {
-    const queue = [...programs];
+  /**
+   * Whether an audio capture binary is on PATH. node-record-lpcm16 spawns
+   * these directly and, when the binary is missing, emits an `error` on its
+   * child process with no listener — which would otherwise crash the whole
+   * app. We pre-filter to binaries that exist so the library never receives a
+   * missing program.
+   */
+  _audioProgramExists(bin) {
+    try {
+      const r = spawnSync(
+        process.platform === 'win32' ? 'where' : 'which',
+        [bin],
+        { windowsHide: true, timeout: 4000 }
+      );
+      return r.status === 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _startMicrophoneCaptureWithFallback(candidates) {
+    const available = candidates.filter((c) => this._audioProgramExists(c.bin));
+
+    if (available.length === 0) {
+      const hint = process.platform === 'darwin'
+        ? 'Install one with `brew install sox`.'
+        : process.platform === 'linux'
+          ? 'Install one with `sudo apt install alsa-utils` (arecord) or `sudo apt install sox`.'
+          : 'No supported microphone capture tool was found.';
+      logger.warn('No audio capture program available', {
+        tried: candidates.map((c) => c.bin),
+        platform: process.platform,
+      });
+      this.isRecording = false;
+      this.emit('error', `Microphone capture needs sox or arecord, but none was found. ${hint}`);
+      return;
+    }
+
+    const queue = [...available];
 
     const tryNextProgram = () => {
-      const program = queue.shift();
-      if (!program) {
-        this.emit('error', 'Could not start microphone capture with any audio program');
+      const candidate = queue.shift();
+      if (!candidate) {
+        this.isRecording = false;
+        this.emit('error', 'Could not start microphone capture with any available audio program');
         return;
       }
 
+      const program = candidate.bin;
       try {
         this.recording = recorder.record({
+          sampleRate: 16000,
           sampleRateHertz: 16000,
           channels: 1,
           threshold: 0,
           verbose: false,
-          recordProgram: program,
+          recorder: candidate.recorder,
           silence: '10.0s'
         });
 
         const stream = this.recording.stream();
         this.audioProgram = program;
+
+        // Guard the spawned child process directly. A spawn failure (e.g. the
+        // binary disappeared between our probe and the spawn, or a permission
+        // error) emits `error` on the child, which node-record-lpcm16 leaves
+        // unhandled — fatal without this listener.
+        const child = this.recording.process;
+        if (child && typeof child.on === 'function') {
+          child.on('error', (error) => {
+            logger.error('Audio recording process error', { error: error.message, program });
+            if (this.recording) {
+              try { this.recording.stop(); } catch (_) { /* ignore */ }
+              this.recording = null;
+            }
+            if (this.isRecording) tryNextProgram();
+          });
+        }
 
         stream.on('error', (error) => {
           logger.error('Audio recording stream error', { error: error.message, program });
@@ -1270,8 +1653,7 @@ class SpeechService extends EventEmitter {
     }
 
     if (this.provider === 'whisper') {
-      this.segmentBuffers.push(Buffer.from(chunk));
-      this.segmentBytes += chunk.length;
+      this._ingestWhisperAudio(Buffer.from(chunk));
     }
   }
 
@@ -1293,8 +1675,11 @@ class SpeechService extends EventEmitter {
 
     try {
       const transcript = await this._transcribeWhisperBuffer(audioBuffer);
-      if (transcript && transcript.trim()) {
-        this.emit('transcription', transcript.trim());
+      const clean = transcript ? transcript.trim() : '';
+      if (clean && !this._isHallucinatedTranscript(clean)) {
+        this.emit('transcription', clean);
+      } else if (clean) {
+        logger.debug('Dropped likely Whisper silence hallucination', { transcript: clean });
       }
     } finally {
       this.transcriptionInFlight = false;
@@ -1305,6 +1690,36 @@ class SpeechService extends EventEmitter {
         await this._flushWhisperSegment({ final: shouldRunFinal });
       }
     }
+  }
+
+  /**
+   * Whisper reliably hallucinates a small set of stock phrases when fed near-
+   * silence or non-speech audio (training-data artifacts from video captions).
+   * VAD already prevents most silent flushes; this is the final guard so these
+   * phantom phrases never reach the chat or the LLM.
+   */
+  _isHallucinatedTranscript(text) {
+    const normalized = text.toLowerCase().replace(/[\s.,!?¡¿"'`]+/g, ' ').trim();
+    if (!normalized) {
+      return true;
+    }
+    const HALLUCINATIONS = new Set([
+      'thank you',
+      'thank you for watching',
+      'thanks for watching',
+      'thank you so much for watching',
+      'please subscribe',
+      'like and subscribe',
+      'you',
+      'bye',
+      'bye bye',
+      'okay',
+      'ok',
+      'so',
+      'the end',
+      'subtitles by the amara org community'
+    ]);
+    return HALLUCINATIONS.has(normalized);
   }
 
   async _transcribeWhisperBuffer(audioBuffer) {

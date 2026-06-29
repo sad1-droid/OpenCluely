@@ -21,7 +21,7 @@ const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const PROBE_TIMEOUT_MS = 8000;
+const PROBE_TIMEOUT_MS = 30000; // first `import whisper` (torch) is slow on a cold cache
 const INSTALL_TIMEOUT_MS = 300000; // pip downloads can be slow on cold cache
 
 /**
@@ -143,6 +143,17 @@ class WhisperInstaller {
   }
 
   /**
+   * Stable, absolute directory for downloaded model weights. Lives alongside
+   * the venv under the persistent data dir (userData in packaged builds) so
+   * the download location and the transcription `--model_dir` always agree.
+   * A relative WHISPER_MODEL_DIR resolved against an unstable cwd was the
+   * cause of models being "downloaded" but not found at transcribe time.
+   */
+  get modelDir() {
+    return path.join(this.dataDir, '.whisper-models');
+  }
+
+  /**
    * Inside the venv:
    *   - macOS/Linux: bin/whisper, bin/python, bin/pip
    *   - Windows:     Scripts\whisper.exe, Scripts\python.exe, Scripts\pip.exe
@@ -188,9 +199,12 @@ class WhisperInstaller {
       // eslint-disable-next-line no-await-in-loop
       const probe = await this._probe(candidate);
       if (probe.ok) {
+        const joined = candidate.join(' ');
         return {
           found: true,
-          command: candidate.join(' '),
+          command: joined.includes(' ') && !joined.startsWith('"')
+            ? `"${candidate[0]}" ${candidate.slice(1).join(' ')}`
+            : joined,
           version: probe.version,
           source: 'probe',
         };
@@ -255,6 +269,21 @@ class WhisperInstaller {
 
     // Step 2: create venv if needed
     if (!venvExists) {
+      // Preflight: on Debian/Ubuntu (and minimal systems / AppImage hosts)
+      // python3 exists but the stdlib `venv`/`ensurepip` modules ship
+      // separately as python3-venv. Detect this explicitly so the user gets an
+      // actionable apt hint instead of a cryptic "ensurepip is not available".
+      const preflight = await this.runExec(python, ['-c', 'import ensurepip, venv'], {
+        timeout: 15000,
+      });
+      if (!preflight.ok) {
+        const msg = this.platform === 'linux'
+          ? 'Python is missing the venv module. Install it with `sudo apt install python3-venv` (or your distro\'s equivalent) and retry.'
+          : 'Python is missing the venv/ensurepip module. Reinstall Python (python.org) with the standard library included and retry.';
+        log(`! ${msg}`);
+        return { ok: false, command: null, message: msg, logs: preflight.stderr || msg };
+      }
+
       log(`→ Creating venv at ${this.venvPath}…`);
       const venvResult = await this.runExec(python, ['-m', 'venv', this.venvPath], {
         timeout: 60000,
@@ -313,15 +342,17 @@ class WhisperInstaller {
       log(`✓ ffmpeg detected (${ffmpeg.path})`);
     } else {
       const ffmpegMsg = this.platform === 'win32'
-        ? 'ffmpeg not found — install with `winget install ffmpeg` or download from gyan.dev. Required for non-WAV audio.'
+        ? 'ffmpeg not found — optional for OpenCluely (we always pass WAV audio to Whisper). Install later with `winget install ffmpeg` only if you need other formats.'
         : this.platform === 'darwin'
-          ? 'ffmpeg not found — install with `brew install ffmpeg`. Required for non-WAV audio.'
-          : 'ffmpeg not found — install with `sudo apt install ffmpeg` (Debian/Ubuntu). Required for non-WAV audio.';
+          ? 'ffmpeg not found — optional for OpenCluely (we always pass WAV audio to Whisper). Install later with `brew install ffmpeg` only if you need other formats.'
+          : 'ffmpeg not found — optional for OpenCluely (we always pass WAV audio to Whisper). Install later with `sudo apt install ffmpeg` only if you need other formats.';
       log(`! ${ffmpegMsg}`);
-      log('  (Whisper will work for WAV files; install ffmpeg later for other formats)');
     }
 
-    const commandStr = `${vp.python} -m whisper`;
+    // Quote the python path if it contains spaces (common on Windows
+    // user profiles like "C:\Users\CANDAN SINGH\...").
+    const pythonPath = vp.python.includes(' ') ? `"${vp.python}"` : vp.python;
+    const commandStr = `${pythonPath} -m whisper`;
     log(`✓ Whisper CLI ready: ${commandStr} (v${verify.version || '?'})`);
 
     return {
@@ -472,11 +503,23 @@ class WhisperInstaller {
         const which = require('child_process').spawnSync(
           this.platform === 'win32' ? 'where' : 'which',
           [c],
-          { windowsHide: true },
+          { windowsHide: true, encoding: 'utf8' },
         );
         if (which.status === 0) {
-          const stdout = (which.stdout || '').toString().split(/\r?\n/)[0].trim();
-          return stdout || c;
+          const lines = (which.stdout || '')
+            .toString()
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean)
+            // Skip the Microsoft Store python stub (…\WindowsApps\python.exe):
+            // it's a launcher that opens the Store and fails `-m venv` with a
+            // cryptic error, so prefer any real interpreter instead.
+            .filter((l) => !/WindowsApps/i.test(l));
+          if (lines.length > 0) {
+            return lines[0];
+          }
+          // `py` is a valid launcher even when `where` prints no usable path.
+          if (c === 'py') return c;
         }
       } catch (_) { /* ignore */ }
     }
@@ -510,52 +553,28 @@ class WhisperInstaller {
     return false;
   }
 
-  /**
-   * Download a Whisper model using the installed CLI.
-   * Models: tiny, base, small, medium, large, turbo
-   */
   async downloadModel(modelName = 'turbo', { onProgress } = {}) {
     const log = (line) => {
       if (typeof onProgress === 'function' && line) {
-        try { onProgress(line); } catch (_) { /* swallow handler errors */ }
+        try { onProgress(line); } catch (_) { /* ignore */ }
       }
     };
 
-    // Get the whisper command
-    const detectResult = await this.detect();
-    if (!detectResult.found) {
-      return { ok: false, message: 'Whisper CLI not found. Install Whisper first.' };
-    }
-
-    const command = detectResult.command;
-    log(`→ Preparing to download ${modelName} model…`);
-
-    // Parse the command to get the python executable that owns the whisper module.
-    let pythonCmd;
-    if (command.includes(' -m ')) {
-      pythonCmd = command.split(' -m ')[0].trim();
-    } else if (command.endsWith(' -m whisper')) {
-      pythonCmd = command.replace(' -m whisper', '').trim();
-    } else {
-      // The command is a whisper binary (likely inside the venv). Derive the
-      // sibling python interpreter from the venv layout.
-      const binDir = path.dirname(command);
-      const isWin = this.platform === 'win32';
-      const pythonExe = isWin ? 'python.exe' : 'python';
-      const candidate = path.join(binDir, pythonExe);
-      if (fs.existsSync(candidate)) {
-        pythonCmd = candidate;
-      } else {
-        pythonCmd = isWin ? 'python' : 'python3';
+    let pythonCmd = this._resolveWhisperPython();
+    if (!pythonCmd) {
+      const detectResult = await this.detect();
+      if (!detectResult.found) {
+        return { ok: false, message: 'Whisper CLI not found. Install Whisper first.' };
       }
+      pythonCmd = this._pythonFromCommand(detectResult.command);
     }
 
-    // whisper.load_model() downloads the weights lazily and prints progress
-    // to stderr. We capture that output and relay it via onProgress.
-    log(`→ Downloading ${modelName} weights (this may take a minute)…`);
+    const downloadRoot = this.modelDir;
+    try { fs.mkdirSync(downloadRoot, { recursive: true }); } catch (_) { /* best effort */ }
+    log(`→ Downloading ${modelName} weights to ${downloadRoot} (this may take a minute)…`);
     const loadResult = await this.runExec(pythonCmd, [
       '-c',
-      `import whisper; whisper.load_model('${modelName}'); print('model_loaded')`
+      `import whisper; whisper.load_model(${JSON.stringify(modelName)}, download_root=${JSON.stringify(downloadRoot)}); print('model_loaded')`
     ], {
       timeout: 600000,
       onProgress: log,
@@ -570,12 +589,35 @@ class WhisperInstaller {
     return { ok: true, message: `Model ${modelName} downloaded successfully`, path: modelPath };
   }
 
+  _resolveWhisperPython() {
+    const vp = this.venvPaths;
+    if (fs.existsSync(vp.python)) return vp.python;
+
+    const configured = (process.env.WHISPER_COMMAND || '').trim();
+    if (configured) return this._pythonFromCommand(configured);
+    return null;
+  }
+
+  _pythonFromCommand(command) {
+    if (!command) return this.platform === 'win32' ? 'python' : 'python3';
+    const tokens = (String(command).match(/(?:[^\s"]+|"[^"]*")+/g) || [])
+      .map((p) => p.replace(/^"|"$/g, ''))
+      .filter(Boolean);
+    if (!tokens.length) return this.platform === 'win32' ? 'python' : 'python3';
+
+    if (tokens.indexOf('-m') > 0) return tokens[0];
+
+    const binDir = path.dirname(tokens[0]);
+    const sibling = path.join(binDir, this.platform === 'win32' ? 'python.exe' : 'python');
+    if (fs.existsSync(sibling)) return sibling;
+    return this.platform === 'win32' ? 'python' : 'python3';
+  }
+
   /**
-   * Get the expected model cache path.
+   * Get the expected model cache path inside our unified model dir.
    */
   _getModelPath(modelName) {
-    const homeDir = require('os').homedir();
-    return path.join(homeDir, '.cache', 'whisper', `${modelName}.pt`);
+    return path.join(this.modelDir, `${modelName}.pt`);
   }
 }
 

@@ -19,6 +19,18 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
 
+  // Quote the executable portion of a command string if it contains spaces.
+  // This keeps Windows user profile paths (e.g. C:\Users\CANDAN SINGH\...) intact.
+  function quoteCommandIfNeeded(cmd) {
+    if (!cmd) return cmd;
+    const firstSpace = cmd.indexOf(' ');
+    if (firstSpace === -1) return cmd;
+    const exe = cmd.slice(0, firstSpace);
+    const rest = cmd.slice(firstSpace + 1);
+    if (exe.startsWith('"') || rest.startsWith('"')) return cmd;
+    return `"${exe}" ${rest}`;
+  }
+
   const screens = $$('.screen');
   const stepperDots = $$('.step-dot');
   const stepBadge = $('#stepBadge');
@@ -322,20 +334,20 @@
         ],
       },
       darwin: {
-        title: "We'll install openai-whisper via pip3 --user",
+        title: "We'll create a project-local venv and install openai-whisper",
         steps: [
           'Uses your existing Python 3 (install via Homebrew if missing).',
-          'Installs into your user site-packages — no <code>sudo</code> required.',
-          'FFmpeg may also be installed automatically if missing.',
+          'A new <code>.venv-whisper/</code> folder is created in the app data directory.',
+          'Whisper installs into that venv — no <code>sudo</code> required.',
           'First transcription downloads the <code>turbo</code> model (~150 MB).',
         ],
       },
       other: {
-        title: "We'll install openai-whisper via pip3 --user",
+        title: "We'll create a project-local venv and install openai-whisper",
         steps: [
-          'Uses your system Python 3.',
-          'Installs into your user site-packages — no <code>sudo</code> required.',
-          'FFmpeg may need to be installed separately (<code>sudo apt install ffmpeg</code>).',
+          'Uses your system Python 3 (needs <code>python3-venv</code> on Debian/Ubuntu).',
+          'A new <code>.venv-whisper/</code> folder is created in the app data directory.',
+          'Whisper installs into that venv — avoids the externally-managed-environment error.',
           'First transcription downloads the <code>turbo</code> model (~150 MB).',
         ],
       },
@@ -523,7 +535,7 @@
           payload.azureRegion = state.azureRegion;
         }
         if (state.speechProvider === 'whisper' && state.whisperCmd) {
-          payload.whisperCommand = state.whisperCmd;
+          payload.whisperCommand = quoteCommandIfNeeded(state.whisperCmd);
         }
         await window.electronAPI.saveSettings(payload);
       } catch (_) { /* surfaced elsewhere */ }
@@ -539,7 +551,7 @@
       // Persist whatever whisper command we found (could be empty if skipped)
       if (window.electronAPI && state.whisperCmd) {
         try {
-          await window.electronAPI.saveSettings({ whisperCommand: state.whisperCmd });
+          await window.electronAPI.saveSettings({ whisperCommand: quoteCommandIfNeeded(state.whisperCmd) });
         } catch (_) { /* ignore */ }
       }
     }

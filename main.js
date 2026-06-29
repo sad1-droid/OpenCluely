@@ -1,7 +1,43 @@
-require("dotenv").config();
-
 const path = require("path");
+const fs = require("fs");
 const { app, BrowserWindow, globalShortcut, session, ipcMain } = require("electron");
+
+// ── Resolve a stable .env location ──
+// In packaged builds process.cwd() is unstable and frequently read-only
+// (NSIS install dir, AppImage mount, .app bundle), so the canonical config
+// lives in Electron's userData directory. We still prefer an existing
+// project-local .env in development (npm start) so the dev workflow is
+// unchanged. Both onboarding (FirstRunManager) and persistEnvUpdates() write
+// to this same path so settings survive restarts on every platform.
+function resolveEnvPath() {
+  try {
+    const userDataEnv = path.join(app.getPath("userData"), ".env");
+    const projectEnv = path.join(process.cwd(), ".env");
+    // Prefer a project .env only when it already exists and userData has none
+    // (i.e. a developer running from the repo). Otherwise use userData.
+    if (!fs.existsSync(userDataEnv) && fs.existsSync(projectEnv)) {
+      return projectEnv;
+    }
+    return userDataEnv;
+  } catch (_) {
+    return path.join(process.cwd(), ".env");
+  }
+}
+const ENV_PATH = resolveEnvPath();
+require("dotenv").config({ path: ENV_PATH });
+
+// Format a value for a single .env line. Newlines are collapsed to spaces and
+// backslashes are kept verbatim (doubling them corrupts Windows paths on the
+// next load). Values containing whitespace, a double-quote, or a leading '#'
+// are wrapped in single quotes so dotenv parses them as one token — essential
+// for Whisper commands like:  "C:\Users\Jane Doe\...\python.exe" -m whisper
+function formatEnvValue(raw) {
+  const v = String(raw).replace(/[\r\n]+/g, " ").trim();
+  if (!/[\s"#]/.test(v)) return v;
+  if (!v.includes("'")) return `'${v}'`;
+  // Rare: value already contains a single quote — fall back to double quotes.
+  return `"${v.replace(/"/g, '\\"')}"`;
+}
 
 // ── Linux GPU process crash workaround ──
 // On many Linux setups (Wayland, X11 without GPU drivers, Docker, headless,
@@ -36,6 +72,25 @@ const logger = require("./src/core/logger").createServiceLogger("MAIN");
 const config = require("./src/core/config");
 const FirstRunManager = require("./src/core/first-run");
 
+// ── Global crash guard ──
+// The speech path spawns external processes (Whisper CLI, and on macOS/Linux
+// the sox/rec/arecord recorders via node-record-lpcm16). A missing recorder
+// binary makes that library emit an 'error' on its child process with no
+// listener, which would otherwise become an uncaughtException and quit the
+// entire app the moment the user clicks the mic. We log and stay alive — the
+// speech service surfaces a friendly status to the UI instead.
+process.on("uncaughtException", (err) => {
+  logger.error("Uncaught exception (kept alive)", {
+    error: err && err.message,
+    stack: err && err.stack,
+  });
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled rejection (kept alive)", {
+    reason: String((reason && reason.message) || reason),
+  });
+});
+
 // Services
 // Screen capture (image-based)
 const captureService = require("./src/services/capture.service");
@@ -55,13 +110,25 @@ class ApplicationController {
   this.codingLanguage = "cpp";
     this.speechAvailable = false;
 
+    // Utterance coalescing: VAD emits a transcript per natural pause, but a
+    // single spoken question can still arrive as a few fragments (mid-thought
+    // pauses). We buffer fragments and debounce so one question yields one LLM
+    // call instead of several slow, half-answered ones.
+    this._utteranceBuffer = "";
+    this._utteranceTimer = null;
+    this._utteranceDispatchInFlight = false;
+    this._utteranceCoalesceMs = 800;
+
     // First-run onboarding: detects missing .env / API key and triggers
     // a settings-window prompt on first launch so users don't have to
     // dig through docs to figure out they need a Gemini API key.
     this.firstRunManager = new FirstRunManager({
       logger: logger,
-      // Sentinel lives in userData so it survives cwd changes
-      // (the app may be launched from any directory).
+      // .env and the sentinel both live in userData so they survive cwd
+      // changes and read-only install dirs (the app may be launched from
+      // any directory). ENV_PATH is the same file dotenv loaded at startup
+      // and that persistEnvUpdates() writes to.
+      envPath: ENV_PATH,
       sentinelPath: path.join(app.getPath("userData"), ".opencluely-firstrun-completed"),
     });
     // Lazily-initialised in getWhisperInstaller() so tests can mock
@@ -308,28 +375,8 @@ class ApplicationController {
       });
     });
 
-    speechService.on("transcription", (text) => {      
-      // Add transcription to session memory
-      sessionManager.addUserInput(text, 'speech');
-      
-      const windows = BrowserWindow.getAllWindows();
-      
-      windows.forEach((window) => {
-        window.webContents.send("transcription-received", { text });
-      });
-      
-      // Automatically process transcription with LLM for intelligent response
-      setTimeout(async () => {
-        try {
-          const sessionHistory = sessionManager.getOptimizedHistory();
-          await this.processTranscriptionWithLLM(text, sessionHistory);
-        } catch (error) {
-          logger.error("Failed to process transcription with LLM", {
-            error: error.message,
-            text: text.substring(0, 100)
-          });
-        }
-      }, 500);
+    speechService.on("transcription", (text) => {
+      this.handleTranscriptionFragment(text);
     });
 
     speechService.on("interim-transcription", (text) => {
@@ -387,6 +434,13 @@ class ApplicationController {
     ipcMain.handle("stop-speech-recognition", () => {
       speechService.stopRecording();
       return speechService.getStatus();
+    });
+
+    // Raw PCM audio captured by the renderer's Web Audio API (Windows Whisper path)
+    ipcMain.on("audio-chunk", (_event, data) => {
+      if (data && data.buffer) {
+        speechService.handleAudioChunkFromRenderer(Buffer.from(data.buffer));
+      }
     });
 
     // Also handle direct send events for fallback
@@ -1090,6 +1144,70 @@ class ApplicationController {
     }
   }
 
+  /**
+   * Buffer a transcribed fragment and (re)arm the coalesce debounce. Fragments
+   * are shown in the UI immediately so speech feels live, but the LLM is only
+   * asked once the speaker has actually paused — this is what stops one spoken
+   * line from producing two separate, slow answers.
+   */
+  handleTranscriptionFragment(text) {
+    const fragment = (text || "").trim();
+    if (!fragment) {
+      return;
+    }
+
+    // Show the live transcript right away in all windows.
+    sessionManager.addUserInput(fragment, 'speech');
+    BrowserWindow.getAllWindows().forEach((window) => {
+      window.webContents.send("transcription-received", { text: fragment });
+    });
+
+    this._utteranceBuffer = this._utteranceBuffer
+      ? `${this._utteranceBuffer} ${fragment}`
+      : fragment;
+
+    if (this._utteranceTimer) {
+      clearTimeout(this._utteranceTimer);
+    }
+    this._utteranceTimer = setTimeout(() => {
+      this._utteranceTimer = null;
+      this.dispatchCoalescedUtterance();
+    }, this._utteranceCoalesceMs);
+  }
+
+  /**
+   * Send the coalesced utterance to the LLM. If a previous dispatch is still
+   * running, leave the buffer intact and let that dispatch's completion pick it
+   * up — so we never pile up overlapping requests for the same person talking.
+   */
+  async dispatchCoalescedUtterance() {
+    if (this._utteranceDispatchInFlight) {
+      return;
+    }
+    const combined = this._utteranceBuffer.trim();
+    if (!combined) {
+      return;
+    }
+    this._utteranceBuffer = "";
+    this._utteranceDispatchInFlight = true;
+
+    try {
+      const sessionHistory = sessionManager.getOptimizedHistory();
+      await this.processTranscriptionWithLLM(combined, sessionHistory);
+    } catch (error) {
+      logger.error("Failed to process transcription with LLM", {
+        error: error.message,
+        text: combined.substring(0, 100)
+      });
+    } finally {
+      this._utteranceDispatchInFlight = false;
+      // Anything that arrived while we were busy gets answered now.
+      if (this._utteranceBuffer.trim()) {
+        this.dispatchCoalescedUtterance();
+      }
+    }
+  }
+
   async processTranscriptionWithLLM(text, sessionHistory) {
     try {
       // Validate input text
@@ -1119,12 +1237,32 @@ class ApplicationController {
       const skillsRequiringProgrammingLanguage = ['dsa'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
-      const llmResult = await llmService.processTranscriptionWithIntelligentResponse(
+      // Stream the answer so it renders progressively in the chat + overlay.
+      // A unique messageId ties the start/chunk/final events to one bubble so
+      // the UI never duplicates or interleaves concurrent responses.
+      this._responseSeq = (this._responseSeq || 0) + 1;
+      const messageId = `tr-${Date.now()}-${this._responseSeq}`;
+      windowManager.broadcastToAllWindows("transcription-llm-response-start", {
+        messageId,
+        skill: this.activeSkill
+      });
+      // Surface the overlay immediately so streamed tokens are visible there
+      // too, instead of the overlay only appearing once the full answer lands.
+      windowManager.showLLMLoading();
+
+      const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
         cleanText,
         this.activeSkill,
         sessionHistory.recent,
-        needsProgrammingLanguage ? this.codingLanguage : null
+        needsProgrammingLanguage ? this.codingLanguage : null,
+        (delta) => {
+          windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
+            messageId,
+            delta
+          });
+        }
       );
+      llmResult.metadata = { ...llmResult.metadata, messageId };
 
       // Add LLM response to session memory
       sessionManager.addModelResponse(llmResult.response, {
@@ -1247,6 +1385,7 @@ class ApplicationController {
     const broadcastData = {
       response: llmResult.response,
       metadata: llmResult.metadata,
+      messageId: llmResult.metadata && llmResult.metadata.messageId,
       skill: this.activeSkill,
       isTranscriptionResponse: true
     };
@@ -1394,6 +1533,12 @@ class ApplicationController {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
       }
 
+      // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
+      // mutates process.env in place, so comparing afterwards would always read
+      // equal and skip the speech re-init below (the exact stale-mic-after-install
+      // bug the re-init guards against).
+      const prevWhisperCommand = process.env.WHISPER_COMMAND || '';
+
       const persistedKeys = this.persistEnvUpdates(envUpdates);
 
       // If the Gemini key was just saved, reinitialize the LLM service
@@ -1420,7 +1565,7 @@ class ApplicationController {
       // would stay hidden / non-functional.
       const providerChanged = settings.speechProvider && speechService.provider !== settings.speechProvider;
       const whisperCommandChanged = settings.whisperCommand !== undefined &&
-        (process.env.WHISPER_COMMAND || '') !== String(settings.whisperCommand || '');
+        prevWhisperCommand !== String(settings.whisperCommand || '');
       if (providerChanged || whisperCommandChanged) {
         try {
           speechService.initializeClient();
@@ -1480,8 +1625,10 @@ class ApplicationController {
     if (keys.length === 0) return [];
 
     const fs = require("fs");
-    const path = require("path");
-    const envPath = path.join(process.cwd(), ".env");
+    // Single source of truth — the same file dotenv loaded at startup and that
+    // FirstRunManager reads/writes (userData in packaged builds, project .env
+    // in dev). Writing to process.cwd() here would silently diverge.
+    const envPath = ENV_PATH;
 
     let existing = "";
     try {
@@ -1500,10 +1647,7 @@ class ApplicationController {
       const m = line.match(/^\s*([A-Z0-9_]+)\s*=/);
       if (m && Object.prototype.hasOwnProperty.call(updates, m[1])) {
         const key = m[1];
-        // Escape any embedded newlines/backslashes in the value so the
-        // resulting .env line is single-line and parseable.
-        const value = String(updates[key]).replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
-        outLines.push(`${key}=${value}`);
+        outLines.push(`${key}=${formatEnvValue(updates[key])}`);
         updated.add(key);
       } else {
         outLines.push(line);
@@ -1513,8 +1657,7 @@ class ApplicationController {
     // Append any keys that weren't already present
     for (const key of keys) {
       if (!updated.has(key)) {
-        const value = String(updates[key]).replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
-        outLines.push(`${key}=${value}`);
+        outLines.push(`${key}=${formatEnvValue(updates[key])}`);
         updated.add(key);
       }
     }
