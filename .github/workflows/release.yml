@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
         include:
           - os: ubuntu-latest
             script: linux
@@ -32,11 +32,6 @@ jobs:
             script: win
             artifact_glob: |
               dist/*.exe
-          - os: macos-latest
-            script: mac
-            artifact_glob: |
-              dist/*.dmg
-              dist/*.zip
 
     steps:
       - name: Checkout
@@ -91,7 +86,6 @@ jobs:
       - name: Build
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Intentionally do NOT set CSC_LINK / WIN_CSC_LINK etc.
           # electron-builder treats empty strings as "set but invalid"
           # and tries to resolve them as certificate paths, producing
@@ -99,7 +93,7 @@ jobs:
           # opt-in: add the secrets to the repo and wire them in here
           # only when you have real certificates.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npm run build:${{ matrix.script }}
+        run: npm run build:${{ matrix.script }} -- --publish never
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -114,6 +108,117 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout (full history for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Generate commit changelog
+        id: changelog
+        shell: bash
+        run: |
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          REPO_URL="https://github.com/${{ github.repository }}"
+
+          PREV_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git tag --sort=-creatordate | grep -vx "${CURRENT_TAG}" | while read -r t; do
+              if git merge-base --is-ancestor "$t" "${CURRENT_TAG}" 2>/dev/null; then echo "$t"; break; fi
+            done | head -1)
+          fi
+
+          if [ -z "$PREV_TAG" ]; then
+            RANGE=""
+            RANGE_LABEL="Initial release"
+          else
+            RANGE="${PREV_TAG}..${CURRENT_TAG}"
+            RANGE_LABEL="[\`${PREV_TAG}...${CURRENT_TAG}\`](${REPO_URL}/compare/${PREV_TAG}...${CURRENT_TAG})"
+          fi
+
+          COMMIT_COUNT=$(git rev-list --count ${RANGE:-HEAD})
+          echo "Changelog range: ${RANGE:-<all commits>} (${COMMIT_COUNT} commits)"
+
+          FS_CHAR="$(printf '\037')"
+          git log ${RANGE:-} --reverse --pretty=format:'%H%x1f%s' | awk -v FS="$FS_CHAR" -v repo="$REPO_URL" '
+            {
+              short=substr($1,1,7); subj=$2; low=tolower(subj); clean=subj;
+              sub(/^([Ff]eat|[Ff]ix|[Dd]ocs|[Cc]hore|[Rr]efactor|[Pp]erf|[Tt]est|[Bb]uild|[Cc]i|[Ss]tyle)(\([^)]*\))?!?:[ ]*/, "", clean);
+              line="- " clean " ([`" short "`](" repo "/commit/" $1 "))";
+              if (low ~ /^(feat|add|introduc|new )/) f[++nf]=line;
+              else if (low ~ /(^fix|bug|hotfix)/) x[++nx]=line;
+              else if (low ~ /^(improv|update|refactor|perf|polish|enhance|optimi)/) m[++ni]=line;
+              else if (low ~ /^(doc|readme)/) d[++nd]=line;
+              else o[++no]=line;
+            }
+            END {
+              if (nf) { print "### Features"; print ""; for(i=1;i<=nf;i++) print f[i]; print "" }
+              if (nx) { print "### Fixes"; print ""; for(i=1;i<=nx;i++) print x[i]; print "" }
+              if (ni) { print "### Improvements"; print ""; for(i=1;i<=ni;i++) print m[i]; print "" }
+              if (nd) { print "### Documentation"; print ""; for(i=1;i<=nd;i++) print d[i]; print "" }
+              if (no) { print "### Other Changes"; print ""; for(i=1;i<=no;i++) print o[i]; print "" }
+            }' > CHANGELOG_SECTION.md
+
+          {
+            echo "### Summary"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              echo "This release includes **${COMMIT_COUNT} commits** since ${PREV_TAG}."
+            else
+              echo "First release of OpenCluely — **${COMMIT_COUNT} commits**."
+            fi
+            echo ""
+            cat CHANGELOG_SECTION.md
+          } > WHATS_CHANGED.md
+
+          # Write combined body to file (multiline-safe)
+          cat > RELEASE_BODY.md << 'BODY_EOF'
+          ## Installation
+
+          Choose the artifact for your platform:
+
+          | Platform | File | Notes |
+          |---|---|---|
+          | **Windows** | `OpenCluely-Setup-*.exe` | NSIS installer — installs app + adds to Start Menu |
+          | **Linux** | `*.deb` | Debian/Ubuntu — auto-pulls system deps (Python, ffmpeg, GTK) |
+          | **Linux** | `*.AppImage` | Universal — no install, just `chmod +x` and run |
+
+          > **macOS:** no pre-built build is shipped. The app is unsigned/un-notarized, so macOS Gatekeeper blocks it as "damaged". Run OpenCluely from source instead:
+          > ```bash
+          > git clone https://github.com/TechyCSR/OpenCluely && cd OpenCluely && ./setup.sh
+          > ```
+          > Requires Node.js 18+. See the [README](https://github.com/TechyCSR/OpenCluely#quick-start) for details.
+
+          ## First Run
+
+          On first launch, OpenCluely opens the **Settings** window automatically for your **Google Gemini API key**.
+          Get a free key from [Google AI Studio](https://aistudio.google.com/). You can also edit `.env` directly.
+
+          ## Optional: Local Whisper (offline speech)
+
+          Install **Python 3.10+** and **ffmpeg**, then run:
+          ```bash
+          ./setup.sh --skip-install-system-deps
+          ```
+
+          ## Checksums
+
+          See `SHA256SUMS.txt` attached to this release.
+
+          BODY_EOF
+
+          {
+            echo ""
+            echo "## What's Changed"
+            echo ""
+            cat WHATS_CHANGED.md
+            echo ""
+            echo "**Full Changelog**: ${RANGE_LABEL}"
+          } >> RELEASE_BODY.md
+
+          echo "=== Final release body ==="
+          cat RELEASE_BODY.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -122,20 +227,14 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release
-          # Pick only the primary installer per platform (max 2-3 per
-          # platform). This intentionally drops:
+          # Pick only the primary installer per platform. This intentionally drops:
           #   - Windows portable EXE (we ship the NSIS installer)
-          #   - macOS .zip (the DMG is the canonical macOS installer)
           #   - .blockmap files (electron-updater diff metadata)
           #   - latest-*.yml (electron-updater channel metadata)
           #   - Source archives (GitHub auto-generates these from the tag)
           #
           # The order below is the order files appear in the release page.
           find artifacts -type f -name 'OpenCluely-Setup-*.exe' \
-            -exec cp -v {} release/ \;
-          # macOS DMGs — electron-builder omits the arch suffix for the
-          # default (x64) arch, so we keep every OpenCluely-*.dmg.
-          find artifacts -type f -name 'OpenCluely-*.dmg' \
             -exec cp -v {} release/ \;
           find artifacts -type f -name 'opencluely_*_amd64.deb' \
             -exec cp -v {} release/ \;
@@ -157,37 +256,7 @@ jobs:
           name: OpenCluely ${{ github.ref_name }}
           draft: false
           prerelease: false
-          generate_release_notes: true
-          body: |
-            ## Installation
-
-            Choose the artifact for your platform:
-
-            | Platform | File | Notes |
-            |---|---|---|
-            | **Windows** | `OpenCluely-Setup-*.exe` | NSIS installer — installs app + adds to Start Menu |
-            | **macOS (Apple Silicon)** | `*-arm64.dmg` | M1/M2/M3 Macs |
-            | **macOS (Intel)** | `*-x64.dmg` | Older Intel Macs |
-            | **Linux** | `*.deb` | Debian/Ubuntu — auto-pulls system deps (Python, ffmpeg, GTK) |
-            | **Linux** | `*.AppImage` | Universal — no install, just chmod +x and run |
-
-            ## First Run
-
-            On first launch, OpenCluely will create `.env` and open the **Settings** window for you to enter your **Google Gemini API key**. You can paste it in the Settings UI or edit `.env` directly.
-
-            ## Optional: Local Whisper
-
-            For offline speech recognition, install **Python 3.10+** and **ffmpeg** on your system, then run from the project folder:
-
-            ```bash
-            ./setup.sh --skip-install-system-deps
-            ```
-
-            See [README.md](https://github.com/TechyCSR/OpenCluely) for full setup details.
-
-            ## Checksums
-
-            See `SHA256SUMS.txt` attached to this release.
+          body_path: RELEASE_BODY.md
           files: |
             release/*
           fail_on_unmatched_files: false

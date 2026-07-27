@@ -1,4 +1,4 @@
-const { BrowserWindow, screen, desktopCapturer } = require('electron');
+const { BrowserWindow, screen, desktopCapturer, shell } = require('electron');
 const path = require('path');
 const logger = require('../core/logger').createServiceLogger('WINDOW');
 const config = require('../core/config');
@@ -363,8 +363,7 @@ class WindowManager {
           titleBarStyle: 'hiddenInset',
           trafficLightPosition: { x: -100, y: -100 },
           acceptFirstMouse: true,
-          disableAutoHideCursor: true,
-          type: 'panel'
+          disableAutoHideCursor: true
         }),
         level: process.platform === 'darwin' ? 'floating' : undefined,
       };
@@ -385,7 +384,6 @@ class WindowManager {
         ...(process.platform === 'darwin' && {
           titleBarStyle: 'hiddenInset',
           trafficLightPosition: { x: -100, y: -100 },
-          type: 'panel',
           acceptFirstMouse: true
         }),
         level: process.platform === 'darwin' ? 'floating' : undefined,
@@ -409,7 +407,6 @@ class WindowManager {
         ...(process.platform === 'darwin' && {
           titleBarStyle: 'hiddenInset',
           trafficLightPosition: { x: -100, y: -100 },
-          type: 'panel',
           acceptFirstMouse: true
         }),
         level: process.platform === 'darwin' ? 'floating' : undefined,
@@ -448,7 +445,24 @@ class WindowManager {
     browserWindowOptions.simpleFullscreen = false;
 
   const window = new BrowserWindow(browserWindowOptions);
-    
+
+    // External links (GitHub, the website, Google AI Studio, etc.) must open in
+    // the user's real browser, never inside the frameless overlay windows.
+    // Deny any in-app window.open and hand http(s) URLs to the OS browser, and
+    // block the current window from navigating away to an external site.
+    window.webContents.setWindowOpenHandler(({ url }) => {
+      if (/^https?:\/\//i.test(url)) {
+        shell.openExternal(url);
+      }
+      return { action: 'deny' };
+    });
+    window.webContents.on('will-navigate', (event, url) => {
+      if (/^https?:\/\//i.test(url) && url !== window.webContents.getURL()) {
+        event.preventDefault();
+        shell.openExternal(url);
+      }
+    });
+
   // Load the HTML file
     await window.loadFile(windowConfig.file);
     
@@ -612,6 +626,10 @@ class WindowManager {
     // Make window undetectable by screen capture (if supported)
     try {
       window.setContentProtection(true);
+      if (process.platform === 'linux' && !this._warnedNoContentProtection) {
+        this._warnedNoContentProtection = true;
+        logger.warn('Screen-capture protection is unavailable on Linux (Electron limitation). The overlay WILL be visible in screen shares. This stealth feature only works on macOS and Windows.');
+      }
     } catch (error) {
       logger.debug('Content protection not supported on this platform');
     }

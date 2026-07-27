@@ -48,7 +48,8 @@ class LLMService {
       temperature: 0.7,
       topK: 40,
       topP: 0.95,
-      maxOutputTokens: 4096
+      maxOutputTokens: 4096,
+      thinkingConfig: { thinkingBudget: 0 }
     };
 
     const merged = { ...fallback, ...defaults, ...overrides };
@@ -224,6 +225,78 @@ class LLMService {
     }
   }
 
+  async processImageWithSkillStream(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
+    if (!this.isInitialized) {
+      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+    }
+
+    if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
+      throw new Error('Invalid image buffer provided to processImageWithSkillStream');
+    }
+
+    const startTime = Date.now();
+    this.requestCount++;
+
+    try {
+      const { promptLoader } = require('../../prompt-loader');
+      const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
+      const base64 = imageBuffer.toString('base64');
+
+      const geminiRequest = {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: this.formatImageInstruction(activeSkill, programmingLanguage) },
+              { inlineData: { data: base64, mimeType } }
+            ]
+          }
+        ]
+      };
+      this.applyGenerationDefaults(geminiRequest);
+      if (skillPrompt && skillPrompt.trim().length > 0) {
+        geminiRequest.systemInstruction = { parts: [{ text: skillPrompt }] };
+      }
+
+      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
+        if (typeof onDelta === 'function' && delta) {
+          onDelta(delta);
+        }
+      });
+
+      const finalResponse = programmingLanguage
+        ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
+        : fullText;
+
+      logger.logPerformance('LLM image streaming', startTime, {
+        activeSkill,
+        imageSize: imageBuffer.length,
+        responseLength: finalResponse.length,
+        requestId: this.requestCount
+      });
+
+      return {
+        response: finalResponse,
+        metadata: {
+          skill: activeSkill,
+          programmingLanguage,
+          processingTime: Date.now() - startTime,
+          requestId: this.requestCount,
+          usedFallback: false,
+          streamed: true,
+          isImageAnalysis: true,
+          mimeType
+        }
+      };
+    } catch (error) {
+      logger.warn('Streaming image analysis failed, falling back to non-streaming', {
+        error: error.message,
+        requestId: this.requestCount
+      });
+      return this.processImageWithSkill(imageBuffer, mimeType, activeSkill, sessionMemory, programmingLanguage);
+    }
+  }
+
   formatImageInstruction(activeSkill, programmingLanguage) {
     const langNote = programmingLanguage ? ` Use only ${programmingLanguage.toUpperCase()} for any code.` : '';
     return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}`;
@@ -311,8 +384,56 @@ class LLMService {
       if (config.get('llm.gemini.fallbackEnabled')) {
         return this.generateFallbackResponse(text, activeSkill);
       }
-      
+
       throw error;
+    }
+  }
+
+  async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
+    if (!this.isInitialized) {
+      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+    }
+
+    const startTime = Date.now();
+    this.requestCount++;
+
+    try {
+      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+
+      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
+        if (typeof onDelta === 'function' && delta) {
+          onDelta(delta);
+        }
+      });
+
+      const finalResponse = programmingLanguage
+        ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
+        : fullText;
+
+      logger.logPerformance('LLM text streaming', startTime, {
+        activeSkill,
+        textLength: text.length,
+        responseLength: finalResponse.length,
+        requestId: this.requestCount
+      });
+
+      return {
+        response: finalResponse,
+        metadata: {
+          skill: activeSkill,
+          programmingLanguage,
+          processingTime: Date.now() - startTime,
+          requestId: this.requestCount,
+          usedFallback: false,
+          streamed: true
+        }
+      };
+    } catch (error) {
+      logger.warn('Streaming text failed, falling back to non-streaming', {
+        error: error.message,
+        requestId: this.requestCount
+      });
+      return this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage);
     }
   }
 
@@ -740,9 +861,6 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     for (const modelName of modelsToTry) {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          // Pre-flight check
-          await this.performPreflightCheck();
-
           const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('Request timeout')), timeout)
           );
@@ -937,7 +1055,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    */
   async executeStreamingRequest(geminiRequest, onDelta) {
     const maxRetries = config.get('llm.gemini.maxRetries');
-    const timeout = config.get('llm.gemini.timeout');
+    const apiKey = config.getApiKey('GEMINI');
     const primaryModel = this.model;
     const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
     const modelsToTry = [primaryModel, ...fallbackModels];
@@ -947,30 +1065,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     for (const modelName of modelsToTry) {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          await this.performPreflightCheck();
-
-          let fullText = '';
-          const consume = (async () => {
-            const stream = await this.client.models.generateContentStream({
-              model: modelName,
-              contents: geminiRequest.contents,
-              config: geminiRequest.generationConfig,
-              systemInstruction: geminiRequest.systemInstruction
-            });
-            for await (const chunk of stream) {
-              const piece = this._extractChunkText(chunk);
-              if (piece) {
-                fullText += piece;
-                onDelta(piece);
-              }
-            }
-          })();
-
-          const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Request timeout')), timeout)
-          );
-
-          await Promise.race([consume, timeoutPromise]);
+          const fullText = await this._streamRequestForModel(geminiRequest, modelName, apiKey, onDelta);
 
           if (!fullText) {
             throw new Error('Empty streamed response from Gemini API');
@@ -1015,6 +1110,82 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     }
 
     throw lastError || new Error('Gemini streaming request failed');
+  }
+
+  _streamRequestForModel(geminiRequest, modelName, apiKey, onDelta) {
+    const https = require('https');
+    const timeout = config.get('llm.gemini.timeout');
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse`;
+    const postData = JSON.stringify(geminiRequest);
+    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
+
+    const options = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+        'Content-Length': Buffer.byteLength(postData),
+        'User-Agent': this.getUserAgent()
+      },
+      timeout,
+      agent
+    };
+
+    return new Promise((resolve, reject) => {
+      const req = https.request(url, options, (res) => {
+        if (res.statusCode !== 200) {
+          let errBody = '';
+          res.on('data', (c) => { errBody += c; });
+          res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${errBody}`)));
+          return;
+        }
+
+        let fullText = '';
+        let buffer = '';
+
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          buffer += chunk;
+          let idx;
+          while ((idx = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (!line.startsWith('data:')) {
+              continue;
+            }
+            const payload = line.slice(5).trim();
+            if (!payload || payload === '[DONE]') {
+              continue;
+            }
+            try {
+              const json = JSON.parse(payload);
+              const piece = this._extractChunkText(json);
+              if (piece) {
+                fullText += piece;
+                if (typeof onDelta === 'function') {
+                  onDelta(piece);
+                }
+              }
+            } catch (_) {
+              // Partial JSON across chunk boundaries is rare with line framing;
+              // skip anything that doesn't parse cleanly.
+            }
+          }
+        });
+
+        res.on('end', () => resolve(fullText.trim()));
+        res.on('error', (error) => reject(new Error(`Streaming response error: ${error.message}`)));
+      });
+
+      req.on('error', (error) => reject(new Error(`Streaming request failed: ${error.message}`)));
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Streaming request timeout'));
+      });
+
+      req.write(postData);
+      req.end();
+    });
   }
 
   async performPreflightCheck() {

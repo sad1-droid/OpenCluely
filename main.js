@@ -20,7 +20,13 @@ function resolveEnvPath() {
     }
     return userDataEnv;
   } catch (_) {
-    return path.join(process.cwd(), ".env");
+    // On packaged macOS builds, process.cwd() may be inside a read-only .app
+    // bundle. Fall back to userData so .env writes never fail.
+    try {
+      return path.join(app.getPath("userData"), ".env");
+    } catch (e2) {
+      return path.join(process.cwd(), ".env");
+    }
   }
 }
 const ENV_PATH = resolveEnvPath();
@@ -305,7 +311,10 @@ class ApplicationController {
     // Allow HTTPS requests to Google APIs
     ses.webRequest.onBeforeSendHeaders((details, callback) => {
       if (details.url.includes('generativelanguage.googleapis.com')) {
-        details.requestHeaders['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
+        const platformUA = process.platform === 'darwin'
+          ? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36'
+          : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
+        details.requestHeaders['User-Agent'] = platformUA;
       }
       callback({ requestHeaders: details.requestHeaders });
     });
@@ -576,7 +585,7 @@ class ApplicationController {
       // NOT the voice "intelligent filter" pipeline. Voice keeps its filter
       // behaviour; typed chat goes through processWithLLM so it gets real
       // answers using the active skill prompt and recent conversation history.
-      setTimeout(async () => {
+      (async () => {
         try {
           const sessionHistory = sessionManager.getOptimizedHistory();
           await this.processWithLLM(text, sessionHistory);
@@ -586,7 +595,7 @@ class ApplicationController {
             text: text.substring(0, 100)
           });
         }
-      }, 500);
+      })();
 
       return { success: true };
     });
@@ -1041,15 +1050,28 @@ class ApplicationController {
       const skillsRequiringProgrammingLanguage = ['dsa'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
-      const llmResult = await llmService.processImageWithSkill(
+      this._responseSeq = (this._responseSeq || 0) + 1;
+      const messageId = `img-${Date.now()}-${this._responseSeq}`;
+      windowManager.broadcastToAllWindows("transcription-llm-response-start", {
+        messageId,
+        skill: this.activeSkill
+      });
+
+      const llmResult = await llmService.processImageWithSkillStream(
         capture.imageBuffer,
         capture.mimeType || 'image/png',
         this.activeSkill,
         sessionHistory.recent,
-        needsProgrammingLanguage ? this.codingLanguage : null
+        needsProgrammingLanguage ? this.codingLanguage : null,
+        (delta) => {
+          windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
+            messageId,
+            delta
+          });
+        }
       );
+      llmResult.metadata = { ...llmResult.metadata, messageId };
 
-      // Record model response in session
       sessionManager.addModelResponse(llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
@@ -1057,14 +1079,14 @@ class ApplicationController {
         isImageAnalysis: true
       });
 
+      this.broadcastTranscriptionLLMResponse(llmResult);
+
       windowManager.showLLMResponse(llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
         isImageAnalysis: true
       });
-
-      this.broadcastLLMSuccess(llmResult);
     } catch (error) {
       logger.error("Screenshot OCR process failed", {
         error: error.message,
@@ -1093,13 +1115,28 @@ class ApplicationController {
       // Check if current skill needs programming language context
       const skillsRequiringProgrammingLanguage = ['dsa'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
-      
-      const llmResult = await llmService.processTextWithSkill(
+
+      this._responseSeq = (this._responseSeq || 0) + 1;
+      const messageId = `chat-${Date.now()}-${this._responseSeq}`;
+      windowManager.broadcastToAllWindows("transcription-llm-response-start", {
+        messageId,
+        skill: this.activeSkill
+      });
+      windowManager.showLLMLoading();
+
+      const llmResult = await llmService.processTextWithSkillStream(
         text,
         this.activeSkill,
         sessionHistory.recent,
-        needsProgrammingLanguage ? this.codingLanguage : null
+        needsProgrammingLanguage ? this.codingLanguage : null,
+        (delta) => {
+          windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
+            messageId,
+            delta
+          });
+        }
       );
+      llmResult.metadata = { ...llmResult.metadata, messageId };
 
       logger.info("LLM processing completed, showing response", {
         responseLength: llmResult.response.length,
@@ -1116,13 +1153,13 @@ class ApplicationController {
         usedFallback: llmResult.metadata.usedFallback,
       });
 
+      this.broadcastTranscriptionLLMResponse(llmResult);
+
       windowManager.showLLMResponse(llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
       });
-
-      this.broadcastLLMSuccess(llmResult);
     } catch (error) {
       logger.error("LLM processing failed", {
         error: error.message,
@@ -1209,6 +1246,10 @@ class ApplicationController {
   }
 
   async processTranscriptionWithLLM(text, sessionHistory) {
+    // Hoisted so the catch block can tie a fallback answer to the same UI
+    // bubble the streaming start event created; otherwise a total failure
+    // leaves an empty streamed bubble stranded next to the fallback message.
+    let messageId = null;
     try {
       // Validate input text
       if (!text || typeof text !== 'string' || text.trim().length === 0) {
@@ -1241,7 +1282,7 @@ class ApplicationController {
       // A unique messageId ties the start/chunk/final events to one bubble so
       // the UI never duplicates or interleaves concurrent responses.
       this._responseSeq = (this._responseSeq || 0) + 1;
-      const messageId = `tr-${Date.now()}-${this._responseSeq}`;
+      messageId = `tr-${Date.now()}-${this._responseSeq}`;
       windowManager.broadcastToAllWindows("transcription-llm-response-start", {
         messageId,
         skill: this.activeSkill
@@ -1303,6 +1344,11 @@ class ApplicationController {
       // Try to provide a fallback response
       try {
         const fallbackResult = llmService.generateIntelligentFallbackResponse(text, this.activeSkill);
+        // Carry the streaming messageId so the chat/overlay replace the live
+        // bubble instead of leaving it stuck and appending a duplicate.
+        if (messageId) {
+          fallbackResult.metadata = { ...fallbackResult.metadata, messageId };
+        }
 
         sessionManager.addModelResponse(fallbackResult.response, {
           skill: this.activeSkill,
@@ -1725,17 +1771,17 @@ class ApplicationController {
 
       // Set app icon for dock/taskbar
       if (process.platform === "darwin") {
-        // macOS - update dock icon
-        app.dock.setIcon(fullIconPath);
-
-        // Force dock refresh with multiple attempts
-        setTimeout(() => {
+        // macOS - update dock icon (only if dock is available)
+        if (app.dock) {
           app.dock.setIcon(fullIconPath);
-        }, 100);
 
-        setTimeout(() => {
-          app.dock.setIcon(fullIconPath);
-        }, 500);
+          // Force dock refresh with multiple attempts
+          const retryDockIcon = () => {
+            try { app.dock.setIcon(fullIconPath); } catch (_) { /* dock may not exist */ }
+          };
+          setTimeout(retryDockIcon, 100);
+          setTimeout(retryDockIcon, 500);
+        }
       } else {
         // Windows/Linux - update window icons
         windowManager.windows.forEach((window, type) => {
@@ -1779,19 +1825,6 @@ class ApplicationController {
         // Multiple attempts to ensure the name sticks
         app.setName(appName);
 
-        // Force update the bundle name for macOS stealth
-        const { execSync } = require("child_process");
-        try {
-          // Update the app's Info.plist CFBundleName in memory
-          if (process.mainModule && process.mainModule.filename) {
-            const appPath = process.mainModule.filename;
-            // Force set the bundle name directly
-            process.env.CFBundleName = appName.trim();
-          }
-        } catch (e) {
-          // Silently fail if we can't modify bundle info
-        }
-
         // Clear dock badge and reset
         if (app.dock) {
           app.dock.setBadge("");
@@ -1804,8 +1837,10 @@ class ApplicationController {
         }
       }
 
-      // Set app user model ID for Windows taskbar grouping
-      app.setAppUserModelId(`${appName.trim()}-${iconKey}`);
+      // Set app user model ID for Windows taskbar grouping (Windows only)
+      if (process.platform === "win32") {
+        app.setAppUserModelId(`${appName.trim()}-${iconKey}`);
+      }
 
       // Update all window titles to match the new app name
       const windows = windowManager.windows;

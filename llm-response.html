@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OpenCluely</title>
     <script src="lib/markdown.js"></script>
+    <script src="lib/mathrender.js"></script>
     <style>
         .text-white { color: white; }
         .text-gray-300 { color: #d1d5db; }
@@ -62,12 +63,20 @@
             padding: 0; 
             color: #e5e7eb;
         }
-        .markdown-content blockquote { 
-            border-left: 4px solid #6b7280; 
-            padding-left: 1rem; 
+        .markdown-content blockquote {
+            border-left: 4px solid #6b7280;
+            padding-left: 1rem;
             margin: 1rem 0;
             font-style: italic;
             color: #d1d5db;
+        }
+        .math {
+            font-family: 'Cambria Math', 'STIX Two Math', 'Latin Modern Math', Georgia, serif;
+            white-space: nowrap;
+        }
+        .markdown-content sup, .markdown-content sub {
+            font-size: 0.72em;
+            line-height: 0;
         }
 
         /* Main container - ensures full viewport usage */
@@ -826,6 +835,7 @@
             // Render text content
             const textHtml = renderMarkdown(textContent);
             document.getElementById('text-content').innerHTML = textHtml;
+            if (window.renderMathInElement) window.renderMathInElement(document.getElementById('text-content'));
 
             // Render code blocks
             const codeContainer = document.getElementById('code-content');
@@ -870,6 +880,7 @@
             const html = renderMarkdown(response);
             const full = document.getElementById('full-markdown');
             full.innerHTML = html;
+            if (window.renderMathInElement) window.renderMathInElement(full);
 
             // Highlight any code if Prism is available
             if (typeof Prism !== 'undefined') {
@@ -896,6 +907,7 @@
             div.textContent = text;
             return div.innerHTML;
         }
+
 
         // Handle window focus
         window.addEventListener('focus', () => {
